@@ -1,122 +1,62 @@
-# PX4 Drone Autopilot
+# PX4 电机辨识（本分支说明）
 
-[![Releases](https://img.shields.io/github/release/PX4/PX4-Autopilot.svg)](https://github.com/PX4/PX4-Autopilot/releases) [![DOI](https://zenodo.org/badge/22634/PX4/PX4-Autopilot.svg)](https://zenodo.org/badge/latestdoi/22634/PX4/PX4-Autopilot)
+本仓库在 [PX4 Autopilot](https://github.com/PX4/PX4-Autopilot) 基础上增加了**多旋翼单电机推力辨识**相关逻辑，便于台架标定与日志分析。
 
-[![Nuttx Targets](https://github.com/PX4/PX4-Autopilot/workflows/Nuttx%20Targets/badge.svg)](https://github.com/PX4/PX4-Autopilot/actions?query=workflow%3A%22Nuttx+Targets%22?branch=master) [![SITL Tests](https://github.com/PX4/PX4-Autopilot/workflows/SITL%20Tests/badge.svg?branch=master)](https://github.com/PX4/PX4-Autopilot/actions?query=workflow%3A%22SITL+Tests%22)
+---
 
-[![Slack](/.github/slack.svg)](https://join.slack.com/t/px4/shared_invite/zt-si4xo5qs-R4baYFmMjlrT4rQK5yUnaA)
+## 使用前准备
 
-This repository holds the [PX4](http://px4.io) flight control solution for drones, with the main applications located in the [src/modules](https://github.com/PX4/PX4-Autopilot/tree/master/src/modules) directory. It also contains the PX4 Drone Middleware Platform, which provides drivers and middleware to run drones.
+- **控制分配**：`SYS_CTRL_ALLOC = 1`，确保 `control_allocator` 开机自启（否则需手动 `control_allocator start`）。
+- **日志**：`SDLOG_PROFILE` 包含 **Default**（默认值为 1）时，`Identify_data` 会进入飞行日志；若使用 SD 卡上的 `logger_topics.txt` 自定义列表，需自行包含 `Identify_data`。
 
-PX4 is highly portable, OS-independent and supports Linux, NuttX and MacOS out of the box.
+---
 
-* Official Website: http://px4.io (License: BSD 3-clause, [LICENSE](https://github.com/PX4/PX4-Autopilot/blob/master/LICENSE))
-* [Supported airframes](https://docs.px4.io/master/en/airframes/airframe_reference.html) ([portfolio](http://px4.io/#airframes)):
-  * [Multicopters](https://docs.px4.io/master/en/frames_multicopter/)
-  * [Fixed wing](https://docs.px4.io/master/en/frames_plane/)
-  * [VTOL](https://docs.px4.io/master/en/frames_vtol/)
-  * [Autogyro](https://docs.px4.io/master/en/frames_autogyro/)
-  * [Rover](https://docs.px4.io/master/en/frames_rover/)
-  * many more experimental types (Blimps, Boats, Submarines, High altitude balloons, etc)
-* Releases: [Downloads](https://github.com/PX4/PX4-Autopilot/releases)
+## 参数（Commander 组）
 
+| 参数 | 含义 |
+|------|------|
+| **IDEN_TYPE** | `0` 关闭；`1` **定时升档**（每档时间见 `IDEN_STEP_TIME`）；`2` **AUX2 上升沿升档**（见下节） |
+| **IDEN_MOTOR_IDX** | 目标电机序号（1 基，对应混控电机顺序） |
+| **IDEN_STEP_TIME** | 模式 1 下每一档保持时间（秒），默认 5 |
+| **IDEN_TRIG_THR / IDEN_TRIG_TIME** | 油门触发相关（参数保留，按当前固件逻辑以 AUX/门控为准） |
+| **IDEN_AUX_THR** | AUX1 门限相关（参数保留，可与 `RC_MAP_AUX1` 配合） |
 
-## Building a PX4 based drone, rover, boat or robot
+---
 
-The [PX4 User Guide](https://docs.px4.io/master/en/) explains how to assemble [supported vehicles](https://docs.px4.io/master/en/airframes/airframe_reference.html) and fly drones with PX4.
-See the [forum and chat](https://docs.px4.io/master/en/#support) if you need help!
+## 门控与 RC
 
+- **飞行模式**：手飞类（自稳 / 定高 / 定位置 / 特技等，见代码 `identify_rc_mode_active()`）。
+- **AUX1**：`manual_control_setpoint.aux1 > 0` 时允许进入辨识流程（需在地面站配置 **RC_MAP_AUX1**）。
+- **解锁、非 kill** 等安全条件需满足后状态机才运行。
 
-## Changing code and contributing
+---
 
-This [Developer Guide](https://docs.px4.io/master/en/development/development.html) is for software developers who want to modify the flight stack and middleware (e.g. to add new flight modes), hardware integrators who want to support new flight controller boards and peripherals, and anyone who wants to get PX4 working on a new (unsupported) airframe/vehicle.
+## 辨识序列（两种模式共用）
 
-Developers should read the [Guide for Contributions](https://docs.px4.io/master/en/contribute/).
-See the [forum and chat](https://dev.px4.io/master/en/#support) if you need help!
+- 推力指令从 **0.1** 到 **1.0**，步长 **0.05**（共 19 个档位：0.1, 0.15, …, 1.0）。
+- **模式 1（IDEN_TYPE=1）**：按 `IDEN_STEP_TIME` **定时**自动升档。
+- **模式 2（IDEN_TYPE=2）**：**仅当 AUX2 从 ≤0 变为 >0**（上升沿）时升一档；**从 >0 变为 ≤0** 时不升不降，保持当前档。需在地面站配置 **RC_MAP_AUX2**。
+- **每机上电**完整跑完一轮后：标记完成，电机输出**保持为 0**（直至重启）；同一上电周期内不重复整段阶跃。
 
+---
 
-### Weekly Dev Call
+## uORB 话题
 
-The PX4 Dev Team syncs up on a [weekly dev call](https://dev.px4.io/master/en/contribute/#dev_call).
+- **`Identify_data`**：由 `control_allocator` 发布，含 `motor_idx`、`identify_active`、`cmd_norm`（归一化指令）、`pwm_out`（目标路 PWM 等）等，用于记录与离线拟合。
 
-> **Note** The dev call is open to all interested developers (not just the core dev team). This is a great opportunity to meet the team and contribute to the ongoing development of the platform. It includes a QA session for newcomers. All regular calls are listed in the [Dronecode calendar](https://www.dronecode.org/calendar/).
+---
 
+## 主要改动位置（开发参考）
 
-## Maintenance Team
+- `src/modules/control_allocator/ControlAllocator.cpp` / `.hpp`：辨识状态机、单电机覆盖、`Identify_data` 发布。
+- `msg/identify_data.msg`：消息定义。
+- `src/modules/logger/logged_topics.cpp`：默认记录 `Identify_data`。
+- `src/modules/commander/commander_params.c`：`IDEN_*` 参数定义。
 
-  * Project: Founder
-    * [Lorenz Meier](https://github.com/LorenzMeier)
-  * Architecture
-    * [Daniel Agar](https://github.com/dagar)
-  * [Dev Call](https://github.com/PX4/PX4-Autopilot/labels/devcall)
-    * [Ramon Roche](https://github.com/mrpollo)
-  * Communication Architecture
-    * [Beat Kueng](https://github.com/bkueng)
-    * [Julian Oes](https://github.com/JulianOes)
-  * UI in QGroundControl
-    * [Gus Grubba](https://github.com/dogmaphobic)
-  * [Multicopter Flight Control](https://github.com/PX4/PX4-Autopilot/labels/multicopter)
-    * [Mathieu Bresciani](https://github.com/bresch)
-  * [Multicopter Software Architecture](https://github.com/PX4/PX4-Autopilot/labels/multicopter)
-    * [Matthias Grob](https://github.com/MaEtUgR)
-  * [VTOL Flight Control](https://github.com/PX4/PX4-Autopilot/labels/vtol)
-    * [Roman Bapst](https://github.com/RomanBapst)
-  * [Fixed Wing Flight Control](https://github.com/PX4/PX4-Autopilot/labels/fixedwing)
-    * [Roman Bapst](https://github.com/RomanBapst)
-  * OS / NuttX
-    * [David Sidrane](https://github.com/davids5)
-  * Driver Architecture
-    * [Daniel Agar](https://github.com/dagar)
-  * Commander Architecture
-    * [Julian Oes](https://github.com/julianoes)
-  * [UAVCAN](https://github.com/PX4/PX4-Autopilot/labels/uavcan)
-    * [Daniel Agar](https://github.com/dagar)
-  * [State Estimation](https://github.com/PX4/PX4-Autopilot/issues?q=is%3Aopen+is%3Aissue+label%3A%22state+estimation%22)
-    * [Paul Riseborough](https://github.com/priseborough)
-  * Vision based navigation and Obstacle Avoidance
-    * [Markus Achtelik](https://github.com/markusachtelik)
-  * RTPS/ROS2 Interface
-    * [Nuno Marques](https://github.com/TSC21)
+---
 
-See also [maintainers list](https://px4.io/community/maintainers/) (px4.io) and the [contributors list](https://github.com/PX4/PX4-Autopilot/graphs/contributors) (Github).
+## 上游 PX4
 
-## Supported Hardware
+通用编译、烧录、机型与官方文档见：**[PX4 User Guide](https://docs.px4.io/)**。
 
-This repository contains code supporting Pixhawk standard boards (best supported, best tested, recommended choice) and proprietary boards.
-
-### Pixhawk Standard Boards
-  * FMUv6X and FMUv6U (STM32H7, 2021)
-    * Various vendors will provide FMUv6X and FMUv6U based designs Q3/2021
-  * FMUv5 and FMUv5X (STM32F7, 2019/20)
-    * [Pixhawk 4 (FMUv5)](https://docs.px4.io/master/en/flight_controller/pixhawk4.html)
-    * [Pixhawk 4 mini (FMUv5)](https://docs.px4.io/master/en/flight_controller/pixhawk4_mini.html)
-    * [CUAV V5+ (FMUv5)](https://docs.px4.io/master/en/flight_controller/cuav_v5_plus.html)
-    * [CUAV V5 nano (FMUv5)](https://docs.px4.io/master/en/flight_controller/cuav_v5_nano.html)
-    * [Auterion Skynode (FMUv5X)](https://docs.px4.io/master/en/flight_controller/auterion_skynode.html)
-  * FMUv4 (STM32F4, 2015)
-    * [Pixracer](https://docs.px4.io/master/en/flight_controller/pixracer.html)
-    * [Pixhawk 3 Pro](https://docs.px4.io/master/en/flight_controller/pixhawk3_pro.html)
-  * FMUv3 (STM32F4, 2014)
-    * [Pixhawk 2](https://docs.px4.io/master/en/flight_controller/pixhawk-2.html)
-    * [Pixhawk Mini](https://docs.px4.io/master/en/flight_controller/pixhawk_mini.html)
-    * [CUAV Pixhack v3](https://docs.px4.io/master/en/flight_controller/pixhack_v3.html)
-  * FMUv2 (STM32F4, 2013)
-    * [Pixhawk](https://docs.px4.io/master/en/flight_controller/pixhawk.html)
-    * [Pixfalcon](https://docs.px4.io/master/en/flight_controller/pixfalcon.html)
-
-### Manufacturer and Community supported
-  * [Holybro Durandal](https://docs.px4.io/master/en/flight_controller/durandal.html)
-  * [Hex Cube Orange](https://docs.px4.io/master/en/flight_controller/cubepilot_cube_orange.html)
-  * [Hex Cube Yellow](https://docs.px4.io/master/en/flight_controller/cubepilot_cube_yellow.html)
-  * [Airmind MindPX V2.8](http://www.mindpx.net/assets/accessories/UserGuide_MindPX.pdf)
-  * [Airmind MindRacer V1.2](http://mindpx.net/assets/accessories/mindracer_user_guide_v1.2.pdf)
-  * [Bitcraze Crazyflie 2.0](https://docs.px4.io/master/en/complete_vehicles/crazyflie2.html)
-  * [Omnibus F4 SD](https://docs.px4.io/master/en/flight_controller/omnibus_f4_sd.html)
-  * [Holybro Kakute F7](https://docs.px4.io/master/en/flight_controller/kakutef7.html)
-  * [Raspberry PI with Navio 2](https://docs.px4.io/master/en/flight_controller/raspberry_pi_navio2.html)
-
-Additional information about supported hardware can be found in [PX4 user Guide > Autopilot Hardware](https://docs.px4.io/master/en/flight_controller/).
-
-## Project Roadmap
-
-A high level project roadmap is available [here](https://github.com/orgs/PX4/projects/25).
+License 等以仓库内 `LICENSE` 及上游 [PX4/PX4-Autopilot](https://github.com/PX4/PX4-Autopilot) 为准。
