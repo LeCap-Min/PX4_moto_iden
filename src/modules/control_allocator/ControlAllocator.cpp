@@ -60,6 +60,11 @@ static inline bool identify_is_motor_mode(int iden_type)
 {
 	return iden_type == 1 || iden_type == 2;
 }
+
+static inline bool identify_is_servo_mode(int iden_type)
+{
+	return iden_type == 3;
+}
 } // namespace
 
 ControlAllocator::ControlAllocator() :
@@ -72,6 +77,7 @@ ControlAllocator::ControlAllocator() :
 	_actuator_servos_pub.advertise();
 	_actuator_servos_trim_pub.advertise();
 	_identify_data_pub.advertise();
+	_servo_iden_data_pub.advertise();
 
 	for (int i = 0; i < MAX_NUM_MOTORS; ++i) {
 		char buffer[17];
@@ -345,6 +351,7 @@ ControlAllocator::Run()
 	if (_num_control_allocation == 0 || _actuator_effectiveness == nullptr) {
 		// Still publish Identify_data so listeners / logger see the topic when the module runs
 		publishIdentifyData(_identify_completed_this_boot ? 0.f : NAN);
+		publishServoIdenData(NAN);
 		perf_end(_loop_perf);
 		return;
 	}
@@ -686,10 +693,10 @@ ControlAllocator::publish_actuator_controls()
 	_actuator_motors_pub.publish(actuator_motors);
 	publishIdentifyData(_identify_completed_this_boot ? 0.f : identify_selected_motor_cmd);
 
-	// servos
-	if (_num_actuators[1] > 0) {
-		int servos_idx;
+	// servos：FashionStar 总线固定 8 路，即使 CA 未配置舵机也要发布 0° 供 fs_uart_servo 初始化
+	int servos_idx = 0;
 
+	if (_num_actuators[1] > 0) {
 		for (servos_idx = 0; servos_idx < _num_actuators[1] && servos_idx < actuator_servos_s::NUM_CONTROLS; servos_idx++) {
 			int selected_matrix = _control_allocation_selection_indexes[actuator_idx];
 			float actuator_sp = _control_allocation[selected_matrix]->getActuatorSetpoint()(actuator_idx_matrix[selected_matrix]);
@@ -697,13 +704,36 @@ ControlAllocator::publish_actuator_controls()
 			++actuator_idx_matrix[selected_matrix];
 			++actuator_idx;
 		}
+	}
 
-		for (int i = servos_idx; i < actuator_servos_s::NUM_CONTROLS; i++) {
-			actuator_servos.control[i] = NAN;
+	for (int i = servos_idx; i < actuator_servos_s::NUM_CONTROLS; i++) {
+		actuator_servos.control[i] = 0.f;
+	}
+
+	// 舵机辨识覆盖 (IDEN_TYPE==3)：仅 IDEN_SV_IDX 对应总线 ID 输出 chirp，其余通道置 0
+	const bool servo_iden_override = _servo_iden_gate_ok && !_servo_iden_completed_this_boot
+					 && !_identify_kill_active;
+	float servo_chirp_cmd = NAN;
+
+	if (servo_iden_override) {
+		for (int i = 0; i < actuator_servos_s::NUM_CONTROLS; i++) {
+			actuator_servos.control[i] = 0.f;
 		}
 
-		_actuator_servos_pub.publish(actuator_servos);
+		if (_servo_iden_index >= 0 && _servo_iden_index < actuator_servos_s::NUM_CONTROLS) {
+			actuator_servos.control[_servo_iden_index] = _servo_chirp_cmd;
+			servo_chirp_cmd = _servo_chirp_cmd;
+		}
 	}
+
+	if (_servo_iden_completed_this_boot && identify_is_servo_mode(_param_iden_type.get())) {
+		for (int i = 0; i < actuator_servos_s::NUM_CONTROLS; i++) {
+			actuator_servos.control[i] = 0.f;
+		}
+	}
+
+	_actuator_servos_pub.publish(actuator_servos);
+	publishServoIdenData(servo_chirp_cmd);
 }
 
 void ControlAllocator::updateIdentifyState(const hrt_abstime now)
@@ -725,6 +755,14 @@ void ControlAllocator::updateIdentifyState(const hrt_abstime now)
 	_identify_motor_index = math::max(0, static_cast<int>(_param_iden_motor_idx.get() - 1));
 
 	const int iden_type = _param_iden_type.get();
+
+	// 舵机辨识模式单独走自己的状态机
+	if (identify_is_servo_mode(iden_type)) {
+		updateServoIdenState(now);
+		_identify_gate_ok = false; // 不走电机辨识覆盖
+		_identify_cmd = 0.f;
+		return;
+	}
 
 	const bool identify_mode_active = identify_rc_mode_active()
 					  && _identify_aux_active
@@ -966,4 +1004,112 @@ extern "C" __EXPORT int control_allocator_main(int argc, char *argv[]);
 int control_allocator_main(int argc, char *argv[])
 {
 	return ControlAllocator::main(argc, argv);
+}
+
+// ---------------------------------------------------------------------------
+// 舵机辨识：log-chirp 计算（迁移自 mc_att_control）
+// ---------------------------------------------------------------------------
+float ControlAllocator::computeLogChirp(float t, float f0, float f_end, float duration, float amplitude, float y0)
+{
+	// 对数扫频：瞬时相位 phi(t) = 2*pi * f0 * T / ln(f_end/f0) * (exp(t/T * ln(f_end/f0)) - 1)
+	const float log_ratio = logf(f_end / f0);
+	const float phi = 2.f * M_PI_F * f0 * duration / log_ratio * (expf(t / duration * log_ratio) - 1.f);
+	return y0 + amplitude * sinf(phi);
+}
+
+// ---------------------------------------------------------------------------
+// 舵机辨识状态机（IDEN_TYPE==3）
+// ---------------------------------------------------------------------------
+void ControlAllocator::updateServoIdenState(const hrt_abstime now)
+{
+	manual_control_setpoint_s manual_control_setpoint{};
+	_manual_control_setpoint_sub.copy(&manual_control_setpoint);
+
+	// AUX1 门控：aux1 > IDEN_AUX_THR 允许辨识
+	const float aux1 = manual_control_setpoint.valid ? manual_control_setpoint.aux1 : 0.f;
+	const bool gate_ok = identify_rc_mode_active()
+			     && (aux1 > _param_iden_aux_thr.get())
+			     && (_vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED)
+			     && !_identify_kill_active;
+
+	_servo_iden_gate_ok = gate_ok;
+	// IDEN_SV_IDX = FashionStar 总线舵机 ID，与 fs_uart_servo 协议中 servo_id（= control[] 下标）一致
+	_servo_iden_index = math::constrain(_param_iden_sv_idx.get(), (int32_t)0,
+					    static_cast<int32_t>(actuator_servos_s::NUM_CONTROLS) - (int32_t)1);
+
+	if (!gate_ok) {
+		_servo_chirp_cmd = 0.f;
+		_servo_chirp_time_active = false;
+		_servo_chirp_t = 0.f;
+		return;
+	}
+
+	if (_servo_iden_completed_this_boot) {
+		_servo_chirp_cmd = 0.f;
+		return;
+	}
+
+	// chirp 参数（固定，与 Omn 保持一致）
+	constexpr float chirp_f0     = 0.01f;   // Hz
+	constexpr float chirp_f_end  = 80.f;    // Hz
+	constexpr float chirp_dur    = 120.f;   // s
+	constexpr float chirp_amp    = 8.f * M_PI_F / 180.f; // rad -> 用于计算，输出转回度
+	constexpr float chirp_amp_deg = 8.f;    // 度
+	constexpr float chirp_y0     = 0.f;
+
+	if (!_servo_chirp_time_active) {
+		_servo_chirp_init_time = now;
+		_servo_chirp_time_active = true;
+	}
+
+	_servo_chirp_t = (now - _servo_chirp_init_time) * 1e-6f;
+
+	if (_servo_chirp_t >= chirp_dur) {
+		_servo_iden_completed_this_boot = true;
+		_servo_chirp_cmd = 0.f;
+		_servo_chirp_time_active = false;
+		return;
+	}
+
+	// computeLogChirp 用弧度幅值计算相位，这里直接用度作为幅值输出
+	(void)chirp_amp; // 仅供参考，输出单位用度
+	_servo_chirp_cmd = computeLogChirp(_servo_chirp_t, chirp_f0, chirp_f_end, chirp_dur, chirp_amp_deg, chirp_y0);
+}
+
+// ---------------------------------------------------------------------------
+// 舵机辨识数据发布
+// ---------------------------------------------------------------------------
+void ControlAllocator::publishServoIdenData(float chirp_cmd)
+{
+	Servo_iden_data_s data{};
+	data.timestamp = hrt_absolute_time();
+	data.iden_active = _servo_iden_gate_ok && !_servo_iden_completed_this_boot && !_identify_kill_active;
+	data.servo_idx   = (uint8_t)_servo_iden_index; // FashionStar 总线舵机 ID
+	data.chirp_signal = PX4_ISFINITE(chirp_cmd) ? chirp_cmd : 0.f;
+
+	// IMU 姿态
+	vehicle_attitude_s att{};
+	if (_vehicle_attitude_sub.copy(&att)) {
+		matrix::Quatf q(att.q);
+		matrix::Eulerf euler(q);
+		data.roll_angle  = math::degrees(euler.phi());
+		data.pitch_angle = math::degrees(euler.theta());
+	} else {
+		data.roll_angle  = NAN;
+		data.pitch_angle = NAN;
+	}
+
+	// 舵机回传（Fs_data，仅当 FS_UT_FB=1 时有效）
+	Fs_data_s fs_data{};
+	if (_fs_data_sub.copy(&fs_data) && fs_data.fb_enabled) {
+		if (_servo_iden_index >= 0 && _servo_iden_index < (int)Fs_data_s::NUM_SERVOS) {
+			data.fb_angle = fs_data.fb_angle_deg[_servo_iden_index];
+		} else {
+			data.fb_angle = NAN;
+		}
+	} else {
+		data.fb_angle = NAN;
+	}
+
+	_servo_iden_data_pub.publish(data);
 }

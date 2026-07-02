@@ -116,6 +116,8 @@ void LoggedTopics::add_default_topics()
 	add_topic("vehicle_status");
 	add_topic("vehicle_status_flags");
 	add_topic("Identify_data", 0);
+	add_topic("Fs_data", 0);
+	add_topic("Servo_iden_data", 0);
 	add_optional_topic("vtol_vehicle_status", 200);
 	add_topic("wind", 1000);
 

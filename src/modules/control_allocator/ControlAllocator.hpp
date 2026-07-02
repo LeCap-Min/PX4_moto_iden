@@ -74,6 +74,9 @@
 #include <uORB/topics/identify_data.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/parameter_update.h>
+#include <uORB/topics/Servo_iden_data.h>
+#include <uORB/topics/Fs_data.h>
+#include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_torque_setpoint.h>
 #include <uORB/topics/vehicle_thrust_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
@@ -137,6 +140,13 @@ private:
 	void updateIdentifyState(const hrt_abstime now);
 	void publishIdentifyData(float selected_motor_cmd);
 
+	/** 舵机辨识状态机，IDEN_TYPE==3 时调用 */
+	void updateServoIdenState(const hrt_abstime now);
+	void publishServoIdenData(float chirp_cmd);
+
+	/** 对数扫频 chirp，迁移自 mc_att_control */
+	static float computeLogChirp(float t, float f0, float f_end, float duration, float amplitude, float y0);
+
 	/** RC 手飞类模式（多数用户用自稳/定高而非纯 Manual），用于辨识门控 */
 	bool identify_rc_mode_active() const;
 
@@ -179,6 +189,7 @@ private:
 	uORB::Publication<actuator_servos_s>	_actuator_servos_pub{ORB_ID(actuator_servos)};
 	uORB::Publication<actuator_servos_trim_s>	_actuator_servos_trim_pub{ORB_ID(actuator_servos_trim)};
 	uORB::Publication<identify_data_s> _identify_data_pub{ORB_ID(Identify_data)};
+	uORB::Publication<Servo_iden_data_s> _servo_iden_data_pub{ORB_ID(Servo_iden_data)};
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
@@ -186,6 +197,8 @@ private:
 	uORB::Subscription _manual_control_setpoint_sub{ORB_ID(manual_control_setpoint)};
 	uORB::Subscription _actuator_outputs_sub{ORB_ID(actuator_outputs)};
 	uORB::Subscription _actuator_armed_sub{ORB_ID(actuator_armed)};
+	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
+	uORB::Subscription _fs_data_sub{ORB_ID(Fs_data)};
 
 	matrix::Vector3f _torque_sp;
 	matrix::Vector3f _thrust_sp;
@@ -222,6 +235,15 @@ private:
 	bool _identify_aux2_prev_valid{false};
 	uint32_t _identify_step_idx{0};
 
+	// --- 舵机辨识状态 (IDEN_TYPE==3) ---
+	bool _servo_iden_completed_this_boot{false};
+	bool _servo_iden_gate_ok{false};
+	float _servo_chirp_cmd{0.f};
+	float _servo_chirp_t{0.f};
+	hrt_abstime _servo_chirp_init_time{0};
+	bool _servo_chirp_time_active{false};
+	int _servo_iden_index{0}; ///< FashionStar 总线舵机 ID（= actuator_servos.control[] 下标）
+
 	ParamHandles _param_handles{};
 	Params _params{};
 	bool _has_slew_rate{false};
@@ -235,7 +257,8 @@ private:
 		(ParamFloat<px4::params::IDEN_TRIG_THR>) _param_iden_trig_thr,
 		(ParamFloat<px4::params::IDEN_TRIG_TIME>) _param_iden_trig_time,
 		(ParamFloat<px4::params::IDEN_STEP_TIME>) _param_iden_step_time,
-		(ParamFloat<px4::params::IDEN_AUX_THR>) _param_iden_aux_thr
+		(ParamFloat<px4::params::IDEN_AUX_THR>) _param_iden_aux_thr,
+		(ParamInt<px4::params::IDEN_SV_IDX>) _param_iden_sv_idx
 	)
 
 };

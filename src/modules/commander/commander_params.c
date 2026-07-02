@@ -582,6 +582,7 @@ PARAM_DEFINE_INT32(COM_FLTMODE6, -1);
  * @value 0 Disabled
  * @value 1 Motor identify (fixed time step, IDEN_STEP_TIME)
  * @value 2 Motor identify (AUX2 rising edge: <=0 to >0 adds one step; falling edge holds level)
+ * @value 3 Servo identify (log-chirp sweep, AUX1 gate, target servo = IDEN_SV_IDX)
  */
 PARAM_DEFINE_INT32(IDEN_TYPE, 0);
 
@@ -647,6 +648,20 @@ PARAM_DEFINE_FLOAT(IDEN_STEP_TIME, 5.0f);
  * @decimal 2
  */
 PARAM_DEFINE_FLOAT(IDEN_AUX_THR, 0.3f);
+
+/**
+ * Identify FS bus servo ID
+ *
+ * FashionStar UART bus servo ID for servo identification (IDEN_TYPE=3).
+ * Must match the servo ID configured on the physical device and on the bus
+ * (same as fs_uart_servo protocol servo_id: actuator_servos.control[ID]).
+ * Example: set 1 to excite bus servo 1 only; set 2 for servo 2, etc.
+ *
+ * @group Commander
+ * @min 0
+ * @max 7
+ */
+PARAM_DEFINE_INT32(IDEN_SV_IDX, 1);
 
 /**
  * Maximum EKF position innovation test ratio that will allow arming

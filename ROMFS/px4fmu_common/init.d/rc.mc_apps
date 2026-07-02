@@ -54,6 +54,11 @@ then
 	# Start Control Allocator
 	#
 	control_allocator start
+
+	if param compare -s FS_UT_BOOT 1
+	then
+		fs_uart_servo start
+	fi
 fi
 
 #

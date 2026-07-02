@@ -10,6 +10,10 @@ set VEHICLE_TYPE mc
 # MAV_TYPE_QUADROTOR 2
 param set-default MAV_TYPE 2
 
+# 辨识固件：启用 control_allocator + FashionStar 舵机驱动自启（见 README）
+param set-default SYS_CTRL_ALLOC 1
+param set-default FS_UT_BOOT 1
+
 if param compare IMU_GYRO_RATEMAX 400
 then
 	param set-default IMU_GYRO_RATEMAX 800

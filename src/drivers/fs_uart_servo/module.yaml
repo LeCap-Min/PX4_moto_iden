@@ -1,0 +1,136 @@
+module_name: FashionStar UART servo bus
+
+parameters:
+    - group: FashionStar 总线舵机
+      definitions:
+
+        FS_UT_GAIN:
+            description:
+                short: 舵机角度增益
+                long: |
+                    对 control_allocator 发布的 actuator_servos.control[i]（单位：度）进行缩放，
+                    再写入 FashionStar 同步指令。默认 1.0 表示不缩放。
+            type: float
+            decimal: 4
+            min: -10
+            max: 10
+            default: 1.0
+
+        FS_UT_TRM:
+            description:
+                short: 舵机角度偏置
+                long: |
+                    各通道统一加减的角度偏置（度），用于机械安装零点校准。
+                    最终角度 = control × 增益 + 偏置，再按单圈/多圈模式限幅。
+            type: float
+            unit: deg
+            decimal: 2
+            min: -90
+            max: 90
+            default: 0.0
+
+        FS_UT_BAUD:
+            description:
+                short: 串口波特率
+                long: |
+                    FashionStar 总线 UART 波特率（与舵机参数 FSUS_PARAM_BAUDRATE 档位一致）。
+                    Pixhawk 6C TELEM2（UART5）经 NuttX termios 支持下列标准及 250000 自定义速率。
+                    修改后需重启飞控；也可用 fs_uart_servo start -b 临时覆盖（须为下列之一）。
+            type: enum
+            reboot_required: true
+            default: 115200
+            values:
+                9600: 9600 bps
+                19200: 19200 bps
+                38400: 38400 bps
+                57600: 57600 bps
+                115200: 115200 bps
+                250000: 250000 bps
+                500000: 500000 bps
+                1000000: 1000000 bps
+
+        FS_UT_INTV:
+            description:
+                short: 运动周期
+                long: |
+                    同步指令中的运动周期（毫秒）。单圈为 16 位周期，多圈为 32 位周期。
+                    0 在驱动中按 500 ms 下发（与 FashionStar 上位机示例一致）；增大该值可放慢舵机动作。
+            type: int32
+            unit: ms
+            default: 50
+            min: 0
+            max: 2000
+
+        FS_UT_TAC:
+            description:
+                short: 加速时间
+                long: |
+                    梯形速度曲线中的加速段时间（毫秒）。0 表示不额外指定加速过程。
+            type: int32
+            unit: ms
+            default: 20
+            min: 0
+            max: 2000
+
+        FS_UT_TDC:
+            description:
+                short: 减速时间
+                long: |
+                    梯形速度曲线中的减速段时间（毫秒）。0 表示不额外指定减速过程。
+            type: int32
+            unit: ms
+            default: 20
+            min: 0
+            max: 2000
+
+        FS_UT_R_HZ:
+            description:
+                short: 驱动刷新率
+                long: |
+                    驱动轮询 actuator_servos 并组帧发送的频率（Hz）。
+                    建议与控制分配器/姿态控制更新率接近（如 200 Hz）。
+            type: int32
+            unit: Hz
+            default: 200
+            min: 20
+            max: 400
+
+        FS_UT_BOOT:
+            description:
+                short: 开机自启驱动
+                long: |
+                    设为开启时：多旋翼机型且 SYS_CTRL_ALLOC=1 时，启动脚本自动执行 fs_uart_servo start。
+                    请确保所用 TELEM 串口未占用 MAVLink（独占总线）。
+                    默认串口为板级 TELEM2（如 /dev/ttyS3）。
+            type: enum
+            values:
+                0: 关闭
+                1: 开启
+            default: 1
+
+        FS_UT_MTURN:
+            description:
+                short: 多圈同步模式
+                long: |
+                    单圈同步：角度限幅 ±180°，与倾转舵机常用范围一致。
+                    多圈同步：角度限幅 ±368640°，需舵机固件支持多圈；control_allocator 仍约 ±180° 时行为与单圈相近。
+                    切换后无需重启，下一帧即按新模式组帧。
+            type: enum
+            values:
+                0: 单圈同步
+                1: 多圈同步
+            default: 0
+
+        FS_UT_FB:
+            description:
+                short: 舵机角度回传
+                long: |
+                    关闭：仅下发同步指令（默认，总线占用最低）。
+                    开启：在同步帧间隙轮询查询各舵机实际角度，写入 Fs_data 主题，便于地面监控/日志分析/失效检测。
+                    切换后无需重启，下一帧即按新设置生效。
+                    回传模式与 FS_UT_MTURN 一致（单圈用 QUERY_ANGLE，多圈用 QUERY_ANGLE_MTURN）。
+            type: enum
+            values:
+                0: 关闭
+                1: 开启
+            default: 0
