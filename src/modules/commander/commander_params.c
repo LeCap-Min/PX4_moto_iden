@@ -582,7 +582,8 @@ PARAM_DEFINE_INT32(COM_FLTMODE6, -1);
  * @value 0 Disabled
  * @value 1 Motor identify (fixed time step, IDEN_STEP_TIME)
  * @value 2 Motor identify (AUX2 rising edge: <=0 to >0 adds one step; falling edge holds level)
- * @value 3 Servo identify (log-chirp sweep, AUX1 gate, target servo = IDEN_SV_IDX)
+ * @value 3 Bus servo identify (FashionStar UART log-chirp, AUX1 gate, target = IDEN_SV_IDX)
+ * @value 4 PWM servo identify (log-chirp, AUX1 gate, target = IDEN_SV_IDX)
  */
 PARAM_DEFINE_INT32(IDEN_TYPE, 0);
 
@@ -640,7 +641,8 @@ PARAM_DEFINE_FLOAT(IDEN_STEP_TIME, 5.0f);
  * Identify AUX1 threshold
  *
  * When RC AUX1 (manual_control_setpoint.aux1, -1..1) is above this value,
- * motor identify is allowed (with IDEN_TYPE 1 or 2).
+ * motor identify is allowed (IDEN_TYPE 1 or 2). Servo identify (3 or 4)
+ * also requires aux1 above this threshold.
  *
  * @group Commander
  * @min -1.0
@@ -650,12 +652,12 @@ PARAM_DEFINE_FLOAT(IDEN_STEP_TIME, 5.0f);
 PARAM_DEFINE_FLOAT(IDEN_AUX_THR, 0.3f);
 
 /**
- * Identify FS bus servo ID
+ * Identify servo channel index
  *
- * FashionStar UART bus servo ID for servo identification (IDEN_TYPE=3).
- * Must match the servo ID configured on the physical device and on the bus
- * (same as fs_uart_servo protocol servo_id: actuator_servos.control[ID]).
- * Example: set 1 to excite bus servo 1 only; set 2 for servo 2, etc.
+ * Target actuator_servos.control[] index for servo identification.
+ * IDEN_TYPE=3: FashionStar UART bus servo ID (same as fs_uart_servo servo_id).
+ * IDEN_TYPE=4: PWM Servo channel (Servo1..Servo8 via PWM_*_FUNCx mapping).
+ * Example: set 1 to excite channel 1 only; set 2 for channel 2, etc.
  *
  * @group Commander
  * @min 0

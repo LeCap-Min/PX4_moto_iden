@@ -30,6 +30,22 @@ const char *default_uart_device_path()
 /** FashionStar FSUS_PARAM_BAUDRATE 档位 + NuttX termios 可配置速率 */
 static constexpr int k_supported_bauds[] = {9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000};
 
+/* The 1 Mbaud schedule is divided into 5 ms control windows. Four single-servo
+ * queries per window give 800 queries/s aggregate, i.e. 100 Hz for each of the
+ * eight servos. A 250 us service tick lets a normal response be consumed before
+ * the next request without busy-waiting on the serial work queue. */
+static constexpr hrt_abstime k_control_interval_us = 5_ms;
+static constexpr uint32_t k_control_rate_hz = 200;
+static constexpr uint32_t k_high_rate_feedback_hz_per_ch = 100;
+static constexpr uint32_t k_legacy_feedback_hz_per_ch = 10;
+static constexpr uint32_t k_high_rate_service_interval_us = 250;
+static constexpr hrt_abstime k_high_rate_query_timeout_us = 1_ms;
+static constexpr hrt_abstime k_legacy_query_timeout_us = 8_ms;
+static constexpr hrt_abstime k_high_rate_post_control_quiet_us = 1_ms;
+static constexpr hrt_abstime k_legacy_post_control_quiet_us = 2_ms;
+static constexpr hrt_abstime k_query_control_guard_us = 1_ms;
+static constexpr uint8_t k_max_query_budget = 4;
+
 bool is_supported_baud(int baud)
 {
 	for (int b : k_supported_bauds) {
@@ -162,10 +178,9 @@ bool FsUartServo::init()
 		_last_sent_sample = 0;
 	}
 
-	const int hz = math::constrain(_param_fs_ut_r_hz.get(), (int32_t)20, (int32_t)400);
-	ScheduleOnInterval(1_s / hz);
 	/* UART is opened in Run() on the serial work queue (same task as write). */
-	PX4_INFO("FashionStar servo: %s poll=%i Hz", _device_path, hz);
+	PX4_INFO("FashionStar servo: %s service=%" PRIu32 " Hz ctrl<=200 Hz fb_target=%" PRIu32 " Hz/ch",
+		 _device_path, 1000000U / _service_interval_us, feedback_target_hz_per_ch());
 
 	return true;
 }
@@ -173,11 +188,18 @@ bool FsUartServo::init()
 void FsUartServo::close_uart()
 {
 	if (_uart_fd >= 0) {
+#if defined(TIOCSSINGLEWIRE)
+		if (_single_wire_active) {
+			/* Do not leave the peripheral in HDSEL mode for the next owner. */
+			(void)::ioctl(_uart_fd, TIOCSSINGLEWIRE, 0);
+		}
+#endif
 		::close(_uart_fd);
 		_uart_fd = -1;
 	}
 
 	_line_baud = -1;
+	_single_wire_active = false;
 }
 
 bool FsUartServo::open_uart()
@@ -238,6 +260,31 @@ bool FsUartServo::open_uart()
 		return false;
 	}
 
+	const bool single_wire = _param_fs_ut_1wire.get() != 0;
+
+#if defined(TIOCSSINGLEWIRE)
+	/* STM32 HDSEL internally joins TX/RX on the TX pin and releases the pin while
+	 * receiving. Push-pull gives adequate rise time at 500 kbaud; the pull-up
+	 * defines the idle state while neither side transmits. */
+	const unsigned long single_wire_flags = single_wire
+			? (SER_SINGLEWIRE_ENABLED | SER_SINGLEWIRE_PUSHPULL | SER_SINGLEWIRE_PULLUP)
+			: 0;
+
+	if (::ioctl(_uart_fd, TIOCSSINGLEWIRE, single_wire_flags) < 0) {
+		PX4_ERR("TIOCSSINGLEWIRE %s failed (%i)", single_wire ? "enable" : "disable", errno);
+		close_uart();
+		return false;
+	}
+
+	_single_wire_active = single_wire;
+#else
+	if (single_wire) {
+		PX4_ERR("single-wire UART is not supported on this target");
+		close_uart();
+		return false;
+	}
+#endif
+
 	/* Re-read after TCSETS; avoid a second tcsetattr (can clear NuttX c_speed → line_baud=0). */
 	struct termios verify {};
 	tcgetattr(_uart_fd, &verify);
@@ -251,7 +298,8 @@ bool FsUartServo::open_uart()
 		PX4_WARN("UART line speed %i bps (requested %i)", _line_baud, baud);
 	}
 
-	PX4_INFO("UART open %s @ %i bps (line=%i)", _device_path, baud, _line_baud);
+	PX4_INFO("UART open %s @ %i bps (line=%i, %s)", _device_path, baud, _line_baud,
+		 _single_wire_active ? "single-wire TX pin" : "full-duplex adapter");
 
 	/* fresh UART → drop any stale bytes and reset RX parser */
 	fs_uart_servo::flush_rx(_uart_fd);
@@ -280,8 +328,8 @@ void FsUartServo::update_params(const bool force)
 	_last_sent_sample = 0;
 	_sent_once = false;
 
-	const int hz = math::constrain(_param_fs_ut_r_hz.get(), (int32_t)20, (int32_t)400);
-	ScheduleOnInterval(1_s / hz);
+	_service_interval_us = schedule_interval_us();
+	ScheduleOnInterval(_service_interval_us);
 
 	const int want_baud = normalize_baud((_baud_cli > 0) ? _baud_cli : _param_fs_ut_baud.get());
 
@@ -290,6 +338,54 @@ void FsUartServo::update_params(const bool force)
 			PX4_WARN("UART reopen after baud update failed");
 		}
 	}
+}
+
+uint32_t FsUartServo::schedule_interval_us() const
+{
+	const int configured_hz = math::constrain(_param_fs_ut_r_hz.get(), (int32_t)20, (int32_t)400);
+	const int selected_baud = normalize_baud((_baud_cli > 0) ? _baud_cli : _param_fs_ut_baud.get());
+
+	if (_param_fs_ut_fb.get() != 0 && selected_baud >= 1000000) {
+		return k_high_rate_service_interval_us;
+	}
+
+	return 1_s / configured_hz;
+}
+
+uint32_t FsUartServo::feedback_target_hz_per_ch() const
+{
+	const int baud = (_line_baud > 0) ? _line_baud
+			 : normalize_baud((_baud_cli > 0) ? _baud_cli : _param_fs_ut_baud.get());
+	return (baud >= 1000000) ? k_high_rate_feedback_hz_per_ch : k_legacy_feedback_hz_per_ch;
+}
+
+hrt_abstime FsUartServo::query_timeout_us() const
+{
+	return feedback_target_hz_per_ch() == k_high_rate_feedback_hz_per_ch
+	       ? k_high_rate_query_timeout_us : k_legacy_query_timeout_us;
+}
+
+void FsUartServo::refill_query_budget(hrt_abstime now)
+{
+	if (_next_query_budget_us == 0) {
+		_next_query_budget_us = now;
+	}
+
+	if (now < _next_query_budget_us) {
+		return;
+	}
+
+	const uint64_t windows = (now - _next_query_budget_us) / k_control_interval_us + 1U;
+	_next_query_budget_us += windows * k_control_interval_us;
+
+	/* Each 5 ms window contributes 8*target/200 query slots. Keeping the
+	 * remainder makes the 10 Hz fallback exact without accumulating a burst. */
+	const uint64_t credit = (uint64_t)_query_credit
+				+ windows * actuator_servos_s::NUM_CONTROLS * feedback_target_hz_per_ch();
+	const uint32_t grant = (uint32_t)(credit / k_control_rate_hz);
+	_query_credit = (uint32_t)(credit % k_control_rate_hz);
+	_query_budget = (uint8_t)math::min((uint32_t)k_max_query_budget,
+			(uint32_t)_query_budget + grant);
 }
 
 void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
@@ -313,12 +409,11 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 	const float angle_max = mturn ? 368640.f : 180.f;
 	const float angle_min = mturn ? -368640.f : -180.f;
 
-	/* SDK examples use 500–1000 ms; interval=0 is not used on wire and may be ignored by servos. */
-	uint16_t interval = u16_clamp_us(_param_fs_ut_intv.get());
-
-	if (interval == 0) {
-		interval = 500;
-	}
+	/* interval=0 selects the official basic sync command with a zero interval
+	 * (fastest mode). A non-zero interval selects the advanced trapezoidal
+	 * command, where t_acc/t_dec are meaningful. */
+	const uint16_t interval = u16_clamp_us(_param_fs_ut_intv.get());
+	const bool fastest_mode = interval == 0;
 	const uint16_t t_acc = u16_clamp_us(_param_fs_ut_tac.get());
 	const uint16_t t_dec = u16_clamp_us(_param_fs_ut_tdc.get());
 
@@ -356,9 +451,15 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 	uint8_t frame[256] {};
 	uint16_t flen = 0;
 
-	if (mturn) {
+	if (mturn && fastest_mode) {
+		flen = fs_uart_servo::build_sync_angle_mturn_frame(sp, actuator_servos_s::NUM_CONTROLS, frame, sizeof(frame));
+
+	} else if (mturn) {
 		flen = fs_uart_servo::build_sync_angle_mturn_by_interval_frame(sp, actuator_servos_s::NUM_CONTROLS, frame,
 				sizeof(frame));
+
+	} else if (fastest_mode) {
+		flen = fs_uart_servo::build_sync_angle_frame(sp, actuator_servos_s::NUM_CONTROLS, frame, sizeof(frame));
 
 	} else {
 		flen = fs_uart_servo::build_sync_angle_by_interval_frame(sp, actuator_servos_s::NUM_CONTROLS, frame,
@@ -370,12 +471,11 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 		return;
 	}
 
-	/* 同步“按周期”：同一 CA 样本在 200Hz 轮询下重复 write 会不断重启轨迹 → 抽搐。
+	/* 同一 CA 样本在 200 Hz 轮询下重复 write 会重复触发舵机指令。
 	 * 按 timestamp_sample 去重；CA 新样本才发。总线封顶 200 Hz。 */
 	static constexpr hrt_abstime k_min_send_interval_us = 5_ms;
 
 	const bool kill_edge = _servo_kill_zero != _servo_kill_zero_prev;
-	_servo_kill_zero_prev = _servo_kill_zero;
 
 	const bool new_sample = !_sent_once || (sv.timestamp_sample != _last_sent_sample) || kill_edge;
 
@@ -385,14 +485,6 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 		}
 
 		return;
-	}
-
-	/* CA 真实节拍：sample 变化才算 */
-	if (_sent_once && sv.timestamp_sample != _last_sent_sample) {
-		_ca_samples_win++;
-
-	} else if (!_sent_once) {
-		_ca_samples_win++;
 	}
 
 	const hrt_abstime now = hrt_absolute_time();
@@ -425,11 +517,16 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 		_last_tx_len = flen;
 		_last_sent_sample = sv.timestamp_sample;
 		_sent_once = true;
+		_servo_kill_zero_prev = _servo_kill_zero;
+		/* write() queues the DMA transfer. Compute the actual line end before
+		 * starting the post-command quiet period. At 1 Mbaud, 1 ms quiet time
+		 * leaves enough room for four query/response transactions per 5 ms. */
+		const uint32_t baud = (_line_baud > 0) ? (uint32_t)_line_baud : (uint32_t)_effective_baud;
+		const hrt_abstime wire_time_us = ((uint64_t)flen * 10ULL * 1000000ULL + baud - 1ULL) / baud;
+		const hrt_abstime quiet_us = (baud >= 1000000)
+				? k_high_rate_post_control_quiet_us : k_legacy_post_control_quiet_us;
+		_post_tx_until = now + wire_time_us + quiet_us;
 	}
-
-	// _last_send = hrt_absolute_time();
-	/* 2ms quiet period before issuing the next query, to let servos process */
-	_post_tx_until = _last_send + 2_ms;
 }
 
 void FsUartServo::send_zero_sync_frame()
@@ -450,13 +547,14 @@ void FsUartServo::send_zero_sync_frame()
 
 /* === FB query / RX state machine ================================================== */
 
-static constexpr hrt_abstime k_query_timeout_us = 8_ms;
-
 void FsUartServo::disable_feedback()
 {
 	fs_uart_servo::flush_rx(_uart_fd);
 	_rx_parser.reset();
 	_query_tx_us = 0;
+	_next_query_budget_us = 0;
+	_query_credit = 0;
+	_query_budget = 0;
 	_online_flags = 0;
 
 	for (auto &a : _fb_angle_deg) {
@@ -470,6 +568,9 @@ void FsUartServo::enable_feedback()
 	_rx_parser.reset();
 	_query_tx_us = 0;
 	_query_id = 0;
+	_next_query_budget_us = hrt_absolute_time();
+	_query_credit = 0;
+	_query_budget = 0;
 	_rtt_ema_us = 0.f;
 	_rtt_max_us = 0.f;
 }
@@ -485,26 +586,36 @@ void FsUartServo::on_query_timeout()
 	_rx_parser.reset();
 }
 
-void FsUartServo::maybe_send_query()
+bool FsUartServo::maybe_send_query()
 {
 	if (_uart_fd < 0) {
-		return;
+		return false;
 	}
 
 	if (_param_fs_ut_fb.get() == 0) {
-		return;
+		return false;
 	}
 
 	/* 等待中：让 poll_rx 收完或超时 */
 	if (_query_tx_us != 0) {
-		return;
+		return false;
 	}
 
 	const hrt_abstime now = hrt_absolute_time();
 
-	/* 紧跟同步帧后保留 2 ms 安静期 */
-	if (now < _post_tx_until) {
-		return;
+	/* 同步帧结束后的安静期，以及当前 5 ms 窗口的查询配额。 */
+	if (now < _post_tx_until || _query_budget == 0) {
+		return false;
+	}
+
+	/* At 1 Mbaud reserve the final millisecond before the next possible 200 Hz
+	 * control frame. A missing reply is therefore timed out before control is due. */
+	if (feedback_target_hz_per_ch() == k_high_rate_feedback_hz_per_ch && _last_send != 0) {
+		const hrt_abstime next_control = _last_send + k_control_interval_us;
+
+		if (now < next_control && now + k_query_control_guard_us >= next_control) {
+			return false;
+		}
 	}
 
 	const bool mturn = _param_fs_ut_mturn.get() != 0;
@@ -514,7 +625,7 @@ void FsUartServo::maybe_send_query()
 			: fs_uart_servo::build_query_angle_frame(_query_id, frame, sizeof(frame));
 
 	if (flen == 0) {
-		return;
+		return false;
 	}
 
 	const ssize_t w = ::write(_uart_fd, frame, flen);
@@ -522,11 +633,15 @@ void FsUartServo::maybe_send_query()
 	if (w == (ssize_t)flen) {
 		_tx_bytes_win += (uint32_t)flen;
 		_query_tx_us = now;
+		_query_budget--;
 		_rx_parser.reset();
+		return true;
 
 	} else {
-		/* 写失败：不计 ok，下次再试 */
+		/* 写失败：不计查询响应错误，下次再试。 */
+		_tx_drop++;
 		_query_tx_us = 0;
+		return false;
 	}
 }
 
@@ -552,8 +667,28 @@ void FsUartServo::poll_rx()
 			const auto r = _rx_parser.feed(buf[i], f);
 
 			if (r == fs_uart_servo::ResponseParser::Result::Frame_ok) {
-				/* content[0]=servo_id；后续 2/4 字节为角度 little-endian ×10 */
-				if (f.content_size >= 3) {
+				_rx_frame_total++;
+				_last_rx_cmd = f.cmd_id;
+				_last_rx_size = f.content_size;
+				_last_rx_id = (f.content_size > 0) ? f.content[0] : UINT8_MAX;
+
+				if (_last_rx_id < actuator_servos_s::NUM_CONTROLS) {
+					_rx_seen_id_flags |= (1u << _last_rx_id);
+				}
+
+				/* Request echoes have header 0x12 0x4c and never reach Frame_ok. For a
+				 * response, require an outstanding query and an exact cmd/id match so
+				 * delayed or duplicate frames cannot advance the query ring. */
+				const bool mturn = _param_fs_ut_mturn.get() != 0;
+				const uint8_t expected_cmd = mturn
+						? fs_uart_servo::k_cmd_query_angle_mturn
+						: fs_uart_servo::k_cmd_query_angle;
+				const uint8_t min_content_size = mturn ? 5 : 3;
+
+				const bool response_matches = _query_tx_us != 0 && f.cmd_id == expected_cmd
+				    && f.content_size >= min_content_size && f.content[0] == _query_id;
+
+				if (response_matches) {
 					const uint8_t id = f.content[0];
 					float angle_deg = NAN;
 
@@ -569,7 +704,7 @@ void FsUartServo::poll_rx()
 						angle_deg = 0.1f * (float)raw;
 					}
 
-					if (id < actuator_servos_s::NUM_CONTROLS && PX4_ISFINITE(angle_deg)) {
+					if (PX4_ISFINITE(angle_deg)) {
 						_fb_angle_deg[id] = angle_deg;
 						_online_flags |= (1u << id);
 						_query_ok_total++;
@@ -589,13 +724,16 @@ void FsUartServo::poll_rx()
 						_query_id = (uint8_t)((_query_id + 1) % actuator_servos_s::NUM_CONTROLS);
 						_query_tx_us = 0;
 					}
+				} else {
+					_rx_match_miss_total++;
 				}
 
-			} else if (r == fs_uart_servo::ResponseParser::Result::Checksum_err
-				   || r == fs_uart_servo::ResponseParser::Result::Cmd_err
-				   || r == fs_uart_servo::ResponseParser::Result::Header_err
-				   || r == fs_uart_servo::ResponseParser::Result::Size_err) {
+			} else if (r == fs_uart_servo::ResponseParser::Result::Checksum_err && _query_tx_us != 0) {
+				/* Header/cmd/size misses while scanning are commonly bytes from our
+				 * echoed request frames. Only a checksum failure on a candidate response
+				 * is a receive error; an unanswered request is counted once on timeout. */
 				_query_err_total++;
+				_rx_checksum_err_total++;
 			}
 		}
 	}
@@ -604,7 +742,7 @@ void FsUartServo::poll_rx()
 	if (_query_tx_us != 0) {
 		const hrt_abstime now = hrt_absolute_time();
 
-		if (now - _query_tx_us > k_query_timeout_us) {
+		if (now - _query_tx_us > query_timeout_us()) {
 			on_query_timeout();
 		}
 	}
@@ -653,8 +791,9 @@ void FsUartServo::publish_fs_data()
 {
 	const hrt_abstime now = hrt_absolute_time();
 
-	/* 10 Hz */
-	if (_last_fs_data_pub != 0 && (now - _last_fs_data_pub) < 100_ms) {
+	/* Keep command/feedback logging aligned with the 200 Hz control cadence.
+	 * Feedback for each individual servo is still refreshed at up to 100 Hz. */
+	if (_last_fs_data_pub != 0 && (now - _last_fs_data_pub) < k_control_interval_us) {
 		return;
 	}
 
@@ -739,25 +878,45 @@ void FsUartServo::Run()
 
 	actuator_servos_s srv{};
 
+	/* Always cache the newest command, but arbitrate UART access only after RX
+	 * has been drained. This prevents a 200 Hz control stream from starving
+	 * feedback queries or transmitting over a pending servo response. */
 	while (_actuator_servos_sub.update(&srv)) {
 		_last_srv = srv;
 		_last_srv_valid = true;
-		send_latest_frame(srv);
+		_ca_samples_win++;
 	}
 
 	if (!_last_srv_valid && _actuator_servos_sub.copy(&_last_srv)) {
 		_last_srv_valid = true;
-		send_latest_frame(_last_srv);
+		_ca_samples_win++;
 	}
 
-	if (_send_pending && _last_srv_valid) {
-		send_latest_frame(_last_srv);
-	}
-
-	/* 回传：先收 RX，再决定要不要发下一个查询 */
+	/* 回传：必须先收 RX/处理超时，再决定本周期总线由查询还是同步帧使用。 */
 	if (fb_now) {
 		poll_rx();
-		maybe_send_query();
+		refill_query_budget(hrt_absolute_time());
+	}
+
+	const bool kill_edge = _servo_kill_zero != _servo_kill_zero_prev;
+	const bool sync_pending = _last_srv_valid
+			&& (!_sent_once || _send_pending || kill_edge || _last_srv.timestamp_sample != _last_sent_sample);
+	const hrt_abstime now = hrt_absolute_time();
+	const bool control_due = sync_pending && (_last_send == 0 || kill_edge
+			|| (now - _last_send) + 200 >= k_control_interval_us);
+	const bool query_due = fb_now && _query_tx_us == 0 && _query_budget > 0 && now >= _post_tx_until;
+
+	if (_query_tx_us == 0) {
+		if (kill_edge && sync_pending) {
+			/* Safety zero always wins over telemetry. */
+			send_latest_frame(_last_srv);
+
+		} else if (control_due) {
+			send_latest_frame(_last_srv);
+
+		} else if (query_due) {
+			(void)maybe_send_query();
+		}
 	}
 
 	update_stats_window();
@@ -836,7 +995,9 @@ int FsUartServo::print_usage(const char *reason)
 Subscribes to `actuator_servos`. Interprets `control[0–7]` as **tilt angles in degrees**
 (from `control_allocator` / custom allocation) plus optional scaling/trim (`FS_UT_GAIN`, `FS_UT_TRM`).
 
-Translates FashionStar **sync angle-by-interval** command (FashionStar cmd ID 25) and writes to a UART.
+Translates FashionStar **sync angle** commands (FashionStar cmd ID 25) and writes to a UART.
+`FS_UT_INTV=0` selects the official fastest/basic command; a non-zero value selects
+the angle-by-interval command with `FS_UT_TAC`/`FS_UT_TDC` profiling.
 `FS_UT_MTURN` selects single-turn (±180°) or multi-turn (±368640°) subcommand layout.
 Do not simultaneously map `Servo1–8` to PWM outputs for the same angles (degrees are not PX4 −1…1 servo norm).
 
@@ -845,7 +1006,8 @@ Transmits on new actuator_servos samples only; bus capped ~200 Hz to avoid re-tr
 
 ### Boot
 
-Set `FS_UT_BOOT=1` (multicopter, `SYS_CTRL_ALLOC=1`) after disabling MAVLink on the chosen uart.
+`control_allocator` starts this driver when **IDEN_TYPE=3** (bus servo identify); stops it for all other modes.
+Ensure MAVLink is not using the same UART (default board TELEM2).
 
 ### CLI
 
@@ -867,7 +1029,8 @@ int FsUartServo::print_status()
 {
 	hrt_abstime now = hrt_absolute_time();
 
-	PX4_INFO("UART %s fd=%i param_baud=%i line_baud=%i", _device_path, _uart_fd, _effective_baud, _line_baud);
+	PX4_INFO("UART %s fd=%i param_baud=%i line_baud=%i wire=%s", _device_path, _uart_fd, _effective_baud, _line_baud,
+		 _single_wire_active ? "single(TX pin)" : "adapter(TX/RX)");
 	PX4_INFO("TX %" PRIu32 " drop %" PRIu32 " last %" PRIu32 " us ago",
 		 _tx_count, _tx_drop,
 		 (uint32_t)(_last_send == 0 ? 999999999u : (now > _last_send ? (uint32_t)(now - _last_send) : 0u)));
@@ -876,13 +1039,15 @@ int FsUartServo::print_status()
 		 _param_fs_ut_mturn.get() != 0 ? "Multi-turn" : "Single-turn",
 		 (long long)_param_fs_ut_mturn.get());
 
-	PX4_INFO("gain %.4f trim %.2f intv %lld ms tac %lld tdc %lld poll %llu Hz",
+	PX4_INFO("gain %.4f trim %.2f motion=%s intv %lld ms tac %lld tdc %lld poll %llu Hz service %.0f Hz",
 		 (double)_param_fs_ut_gain.get(),
 		 (double)_param_fs_ut_trm.get(),
+		 _param_fs_ut_intv.get() == 0 ? "fast" : "timed",
 		 (long long)_param_fs_ut_intv.get(),
 		 (long long)_param_fs_ut_tac.get(),
 		 (long long)_param_fs_ut_tdc.get(),
-		 (unsigned long long)_param_fs_ut_r_hz.get());
+		 (unsigned long long)_param_fs_ut_r_hz.get(),
+		 _service_interval_us > 0 ? 1000000.0 / (double)_service_interval_us : 0.0);
 
 	/* 总线统计（始终显示）*/
 	PX4_INFO("TX bps %.0f (~%.1f kbps) Hz %.1f  drop_dup %" PRIu32,
@@ -893,8 +1058,12 @@ int FsUartServo::print_status()
 		 (double)_ca_hz, (double)_effective_ctrl_hz);
 
 	if (_param_fs_ut_fb.get() != 0) {
-		PX4_INFO("feedback ON  online=0x%02X  q_ok=%" PRIu32 "  q_err=%" PRIu32,
-			 _online_flags, _query_ok_total, _query_err_total);
+		PX4_INFO("feedback ON target=%" PRIu32 " Hz/ch budget=%u online=0x%02X q_ok=%" PRIu32 " q_err=%" PRIu32,
+			 feedback_target_hz_per_ch(), _query_budget, _online_flags, _query_ok_total, _query_err_total);
+		PX4_INFO("RX frames=%" PRIu32 " mismatch=%" PRIu32 " checksum=%" PRIu32
+			 " seen_id=0x%02X last(cmd/id/len)=%u/%u/%u waiting_id=%u",
+			 _rx_frame_total, _rx_match_miss_total, _rx_checksum_err_total, _rx_seen_id_flags,
+			 _last_rx_cmd, _last_rx_id, _last_rx_size, _query_id);
 		PX4_INFO("per-ch Hz: %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
 			 (double)_query_hz_per_ch[0], (double)_query_hz_per_ch[1],
 			 (double)_query_hz_per_ch[2], (double)_query_hz_per_ch[3],
@@ -907,7 +1076,7 @@ int FsUartServo::print_status()
 			 (double)_fb_angle_deg[6], (double)_fb_angle_deg[7]);
 		PX4_INFO("RTT ema=%.0f us  max=%.0f us  (timeout=%llu us)",
 			 (double)_rtt_ema_us, (double)_rtt_max_us,
-			 (unsigned long long)k_query_timeout_us);
+			 (unsigned long long)query_timeout_us());
 
 	} else {
 		PX4_INFO("feedback OFF (set FS_UT_FB=1 to enable angle readback)");

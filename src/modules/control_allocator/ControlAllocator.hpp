@@ -140,9 +140,12 @@ private:
 	void updateIdentifyState(const hrt_abstime now);
 	void publishIdentifyData(float selected_motor_cmd);
 
-	/** 舵机辨识状态机，IDEN_TYPE==3 时调用 */
+	/** 舵机辨识状态机，IDEN_TYPE==3（总线）或 4（PWM）时调用 */
 	void updateServoIdenState(const hrt_abstime now);
 	void publishServoIdenData(float chirp_cmd);
+
+	/** IDEN_TYPE==3 时启动 fs_uart_servo，其余模式关闭（辨识专用固件） */
+	void updateFsUartServoIdenGuard(int iden_type);
 
 	/** 对数扫频 chirp，迁移自 mc_att_control */
 	static float computeLogChirp(float t, float f0, float f_end, float duration, float amplitude, float y0);
@@ -235,14 +238,16 @@ private:
 	bool _identify_aux2_prev_valid{false};
 	uint32_t _identify_step_idx{0};
 
-	// --- 舵机辨识状态 (IDEN_TYPE==3) ---
+	// --- 舵机辨识状态 (IDEN_TYPE==3 总线 / 4 PWM) ---
 	bool _servo_iden_completed_this_boot{false};
 	bool _servo_iden_gate_ok{false};
 	float _servo_chirp_cmd{0.f};
 	float _servo_chirp_t{0.f};
 	hrt_abstime _servo_chirp_init_time{0};
 	bool _servo_chirp_time_active{false};
-	int _servo_iden_index{0}; ///< FashionStar 总线舵机 ID（= actuator_servos.control[] 下标）
+	int _servo_iden_index{0}; ///< actuator_servos.control[] 下标
+
+	int _iden_type_prev{-1}; ///< 上一周期 IDEN_TYPE，用于 fs_uart_servo 切换日志
 
 	ParamHandles _param_handles{};
 	Params _params{};

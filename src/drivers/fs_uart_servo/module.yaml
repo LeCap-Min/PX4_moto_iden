@@ -54,7 +54,8 @@ parameters:
                 short: 运动周期
                 long: |
                     同步指令中的运动周期（毫秒）。单圈为 16 位周期，多圈为 32 位周期。
-                    0 在驱动中按 500 ms 下发（与 FashionStar 上位机示例一致）；增大该值可放慢舵机动作。
+                    0 使用 FashionStar 官方普通同步角度指令并下发零周期（极速模式）；
+                    大于 0 使用带加减速时间的指定周期指令。增大该值可放慢舵机动作。
             type: int32
             unit: ms
             default: 50
@@ -66,6 +67,7 @@ parameters:
                 short: 加速时间
                 long: |
                     梯形速度曲线中的加速段时间（毫秒）。0 表示不额外指定加速过程。
+                    仅在 FS_UT_INTV 大于 0 的指定周期模式中生效。
             type: int32
             unit: ms
             default: 20
@@ -77,6 +79,7 @@ parameters:
                 short: 减速时间
                 long: |
                     梯形速度曲线中的减速段时间（毫秒）。0 表示不额外指定减速过程。
+                    仅在 FS_UT_INTV 大于 0 的指定周期模式中生效。
             type: int32
             unit: ms
             default: 20
@@ -89,6 +92,8 @@ parameters:
                 long: |
                     驱动轮询 actuator_servos 并组帧发送的频率（Hz）。
                     建议与控制分配器/姿态控制更新率接近（如 200 Hz）。
+                    1 Mbaud 且开启回传时，驱动内部自动使用 4 kHz 总线服务节拍；
+                    本参数仍控制普通模式的输入轮询，控制同步帧最高保持 200 Hz。
             type: int32
             unit: Hz
             default: 200
@@ -97,16 +102,16 @@ parameters:
 
         FS_UT_BOOT:
             description:
-                short: 开机自启驱动
+                short: 开机自启驱动（已弃用）
                 long: |
-                    设为开启时：多旋翼机型且 SYS_CTRL_ALLOC=1 时，启动脚本自动执行 fs_uart_servo start。
-                    请确保所用 TELEM 串口未占用 MAVLink（独占总线）。
-                    默认串口为板级 TELEM2（如 /dev/ttyS3）。
+                    本辨识固件中 fs_uart_servo 由 control_allocator 按 IDEN_TYPE 管理：
+                    IDEN_TYPE=3 时自动 start，其它模式自动 stop。启动脚本不再读取本参数。
+                    保留参数仅为兼容；请直接设置 IDEN_TYPE=3 启用总线舵机。
             type: enum
             values:
                 0: 关闭
                 1: 开启
-            default: 1
+            default: 0
 
         FS_UT_MTURN:
             description:
@@ -129,8 +134,25 @@ parameters:
                     开启：在同步帧间隙轮询查询各舵机实际角度，写入 Fs_data 主题，便于地面监控/日志分析/失效检测。
                     切换后无需重启，下一帧即按新设置生效。
                     回传模式与 FS_UT_MTURN 一致（单圈用 QUERY_ANGLE，多圈用 QUERY_ANGLE_MTURN）。
+                    1 Mbaud 时目标为每路 100 Hz（总计 800 次查询/秒），并保持控制同步帧最高 200 Hz；
+                    较低波特率自动使用每路约 10 Hz 的保守轮询。
             type: enum
             values:
                 0: 关闭
                 1: 开启
             default: 0
+
+        FS_UT_1WIRE:
+            description:
+                short: 单线半双工模式
+                long: |
+                    开启：STM32 UART 使用 TX 引脚作为单线半双工端口，TX 直接连接舵机 S 信号，RX 引脚不用。
+                    UART 在发送完成后自动释放线路，供舵机回传。适用于 TELEM2 TX 直连 FashionStar S 信号。
+                    关闭：使用普通全双工 UART，适用于 UC-01 等具有独立 RX/TX 的半双工转换板。
+                    修改后必须重启飞控。直连模式仍须保证共地、逻辑电平兼容及正确的舵机供电。
+            type: enum
+            reboot_required: true
+            values:
+                0: 双线/转接板
+                1: 单线直连
+            default: 1

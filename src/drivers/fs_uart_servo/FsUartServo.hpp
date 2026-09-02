@@ -54,6 +54,10 @@ private:
 	void Run() override;
 
 	void update_params(const bool force);
+	uint32_t schedule_interval_us() const;
+	uint32_t feedback_target_hz_per_ch() const;
+	hrt_abstime query_timeout_us() const;
+	void refill_query_budget(hrt_abstime now);
 
 	void refresh_servo_kill_state();
 
@@ -65,20 +69,21 @@ private:
 
 	/* --- 角度回传（FS_UT_FB=1）--- */
 	void poll_rx();                     ///< drain UART RX, feed parser, update fb_*
-	void maybe_send_query();            ///< issue next query if window permits
+	bool maybe_send_query();            ///< issue next query if window permits
 	void on_query_timeout();            ///< mark current id offline, advance ring
 	void disable_feedback();            ///< called when FS_UT_FB transitions 1->0
 	void enable_feedback();             ///< called when FS_UT_FB transitions 0->1
 
 	/* --- 统计 / Fs_data --- */
 	void update_stats_window();         ///< 1s window diff → snapshot
-	void publish_fs_data();             ///< write Fs_data topic (~10 Hz)
+	void publish_fs_data();             ///< write Fs_data topic (up to 200 Hz)
 
 	char _device_path[64] {};
 	int _baud_cli{-1};
 	int _uart_fd{-1};
 	int _effective_baud{-1};
 	int _line_baud{-1}; ///< NuttX UART rate after tcsetattr (0 = unknown)
+	bool _single_wire_active{false};
 
 	float _last_deg[actuator_servos_s::NUM_CONTROLS] {};
 	float _last_cmd_deg[actuator_servos_s::NUM_CONTROLS] {}; ///< last sync frame deg (after gain/trim/kill)
@@ -101,6 +106,10 @@ private:
 	bool _fb_enabled_prev{false};
 	uint8_t _query_id{0};            ///< 0..7 当前正在等待响应的 ID
 	hrt_abstime _query_tx_us{0};     ///< 查询帧发出时间；0 表示当前空闲
+	hrt_abstime _next_query_budget_us{0}; ///< 下一个 5 ms 查询配额窗口
+	uint32_t _query_credit{0};       ///< 分数配额，单位为 query Hz / 200 Hz control window
+	uint8_t _query_budget{0};        ///< 当前 5 ms 窗口尚可发送的查询数
+	uint32_t _service_interval_us{0}; ///< ScheduledWorkItem 实际服务周期
 	float _fb_angle_deg[actuator_servos_s::NUM_CONTROLS] {}; ///< 最近一次成功回传角度
 	uint8_t _online_flags{0};
 	fs_uart_servo::ResponseParser _rx_parser{};
@@ -121,6 +130,13 @@ private:
 	uint32_t _ca_drop_dup{0};
 	uint32_t _query_ok_total{0};
 	uint32_t _query_err_total{0};
+	uint32_t _rx_frame_total{0};       ///< checksum-valid angle response frames, including unmatched ones
+	uint32_t _rx_match_miss_total{0};  ///< valid response whose cmd/id did not match the outstanding query
+	uint32_t _rx_checksum_err_total{0};
+	uint8_t _rx_seen_id_flags{0};      ///< response IDs 0..7 observed on the wire, regardless of query match
+	uint8_t _last_rx_cmd{0};
+	uint8_t _last_rx_id{UINT8_MAX};
+	uint8_t _last_rx_size{0};
 
 	/* --- RTT --- */
 	float _rtt_ema_us{0.f};
@@ -148,6 +164,7 @@ private:
 		(ParamInt<px4::params::FS_UT_TDC>) _param_fs_ut_tdc,
 		(ParamInt<px4::params::FS_UT_R_HZ>) _param_fs_ut_r_hz,
 		(ParamInt<px4::params::FS_UT_MTURN>) _param_fs_ut_mturn,
-		(ParamInt<px4::params::FS_UT_FB>) _param_fs_ut_fb
+		(ParamInt<px4::params::FS_UT_FB>) _param_fs_ut_fb,
+		(ParamInt<px4::params::FS_UT_1WIRE>) _param_fs_ut_1wire
 	)
 };

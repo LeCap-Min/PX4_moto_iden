@@ -41,6 +41,7 @@
 
 #include "ControlAllocator.hpp"
 
+#include <px4_platform_common/px4_config.h>
 #include <drivers/drv_hrt.h>
 #include <circuit_breaker/circuit_breaker.h>
 #include <mathlib/math/Limits.hpp>
@@ -61,10 +62,45 @@ static inline bool identify_is_motor_mode(int iden_type)
 	return iden_type == 1 || iden_type == 2;
 }
 
-static inline bool identify_is_servo_mode(int iden_type)
+static inline bool identify_is_bus_servo_mode(int iden_type)
 {
 	return iden_type == 3;
 }
+
+static inline bool identify_is_pwm_servo_mode(int iden_type)
+{
+	return iden_type == 4;
+}
+
+static inline bool identify_is_servo_mode(int iden_type)
+{
+	return identify_is_bus_servo_mode(iden_type) || identify_is_pwm_servo_mode(iden_type);
+}
+
+/** PWM 舵机：弧度转 actuator_servos 归一化，与 PX4_Tilt 控制分配 1.27f*A 一致（±45° 满舵） */
+static constexpr float k_iden_pwm_servo_rad_scale = 1.27f;
+
+#if defined(CONFIG_DRIVERS_FS_UART_SERVO)
+extern "C" int fs_uart_servo_main(int argc, char *argv[]);
+
+static bool fs_uart_servo_driver_running()
+{
+	char *argv[] = {(char *)"fs_uart_servo", (char *)"status", nullptr};
+	return fs_uart_servo_main(2, argv) == 0;
+}
+
+static void fs_uart_servo_driver_stop()
+{
+	char *argv[] = {(char *)"fs_uart_servo", (char *)"stop", nullptr};
+	(void)fs_uart_servo_main(2, argv);
+}
+
+static int fs_uart_servo_driver_start()
+{
+	char *argv[] = {(char *)"fs_uart_servo", (char *)"start", nullptr};
+	return fs_uart_servo_main(2, argv);
+}
+#endif
 } // namespace
 
 ControlAllocator::ControlAllocator() :
@@ -347,6 +383,7 @@ ControlAllocator::Run()
 	_armed = _vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
 
 	updateIdentifyState(now);
+	updateFsUartServoIdenGuard(_param_iden_type.get());
 
 	if (_num_control_allocation == 0 || _actuator_effectiveness == nullptr) {
 		// Still publish Identify_data so listeners / logger see the topic when the module runs
@@ -710,7 +747,7 @@ ControlAllocator::publish_actuator_controls()
 		actuator_servos.control[i] = 0.f;
 	}
 
-	// 舵机辨识覆盖 (IDEN_TYPE==3)：仅 IDEN_SV_IDX 对应总线 ID 输出 chirp，其余通道置 0
+	// 舵机辨识覆盖 (IDEN_TYPE==3 总线 / 4 PWM)：仅 IDEN_SV_IDX 通道输出 chirp，其余置 0
 	const bool servo_iden_override = _servo_iden_gate_ok && !_servo_iden_completed_this_boot
 					 && !_identify_kill_active;
 	float servo_chirp_cmd = NAN;
@@ -1018,7 +1055,7 @@ float ControlAllocator::computeLogChirp(float t, float f0, float f_end, float du
 }
 
 // ---------------------------------------------------------------------------
-// 舵机辨识状态机（IDEN_TYPE==3）
+// 舵机辨识状态机（IDEN_TYPE==3 总线舵机扫频 / 4 PWM 舵机扫频）
 // ---------------------------------------------------------------------------
 void ControlAllocator::updateServoIdenState(const hrt_abstime now)
 {
@@ -1033,7 +1070,7 @@ void ControlAllocator::updateServoIdenState(const hrt_abstime now)
 			     && !_identify_kill_active;
 
 	_servo_iden_gate_ok = gate_ok;
-	// IDEN_SV_IDX = FashionStar 总线舵机 ID，与 fs_uart_servo 协议中 servo_id（= control[] 下标）一致
+	// IDEN_SV_IDX = actuator_servos.control[] 下标（type3 总线 ID / type4 PWM Servo 通道）
 	_servo_iden_index = math::constrain(_param_iden_sv_idx.get(), (int32_t)0,
 					    static_cast<int32_t>(actuator_servos_s::NUM_CONTROLS) - (int32_t)1);
 
@@ -1051,7 +1088,7 @@ void ControlAllocator::updateServoIdenState(const hrt_abstime now)
 
 	// chirp 参数（固定，与 Omn 保持一致）
 	constexpr float chirp_f0     = 0.01f;   // Hz
-	constexpr float chirp_f_end  = 80.f;    // Hz
+	constexpr float chirp_f_end  = 30.f;    // Hz
 	constexpr float chirp_dur    = 120.f;   // s
 	constexpr float chirp_amp    = 8.f * M_PI_F / 180.f; // rad -> 用于计算，输出转回度
 	constexpr float chirp_amp_deg = 8.f;    // 度
@@ -1071,9 +1108,21 @@ void ControlAllocator::updateServoIdenState(const hrt_abstime now)
 		return;
 	}
 
-	// computeLogChirp 用弧度幅值计算相位，这里直接用度作为幅值输出
-	(void)chirp_amp; // 仅供参考，输出单位用度
-	_servo_chirp_cmd = computeLogChirp(_servo_chirp_t, chirp_f0, chirp_f_end, chirp_dur, chirp_amp_deg, chirp_y0);
+	// computeLogChirp 用弧度幅值计算相位，内部以度为幅值
+	(void)chirp_amp; // 仅供参考
+	const float chirp_deg = computeLogChirp(_servo_chirp_t, chirp_f0, chirp_f_end, chirp_dur, chirp_amp_deg, chirp_y0);
+
+	if (identify_is_bus_servo_mode(_param_iden_type.get())) {
+		// 总线舵机：actuator_servos 为度，fs_uart_servo 直接消费
+		_servo_chirp_cmd = chirp_deg;
+
+	} else if (identify_is_pwm_servo_mode(_param_iden_type.get())) {
+		// PWM 舵机：弧度乘 1.27 映射到 [-1,1]，与 PX4_Tilt 控制分配一致
+		_servo_chirp_cmd = math::constrain(math::radians(chirp_deg) * k_iden_pwm_servo_rad_scale, -1.f, 1.f);
+
+	} else {
+		_servo_chirp_cmd = 0.f;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,7 +1133,7 @@ void ControlAllocator::publishServoIdenData(float chirp_cmd)
 	Servo_iden_data_s data{};
 	data.timestamp = hrt_absolute_time();
 	data.iden_active = _servo_iden_gate_ok && !_servo_iden_completed_this_boot && !_identify_kill_active;
-	data.servo_idx   = (uint8_t)_servo_iden_index; // FashionStar 总线舵机 ID
+	data.servo_idx   = (uint8_t)_servo_iden_index; // actuator_servos.control[] 下标
 	data.chirp_signal = PX4_ISFINITE(chirp_cmd) ? chirp_cmd : 0.f;
 
 	// IMU 姿态
@@ -1099,9 +1148,10 @@ void ControlAllocator::publishServoIdenData(float chirp_cmd)
 		data.pitch_angle = NAN;
 	}
 
-	// 舵机回传（Fs_data，仅当 FS_UT_FB=1 时有效）
+	// 总线舵机回传（Fs_data，IDEN_TYPE=3 且 FS_UT_FB=1 时有效）
 	Fs_data_s fs_data{};
-	if (_fs_data_sub.copy(&fs_data) && fs_data.fb_enabled) {
+	if (identify_is_bus_servo_mode(_param_iden_type.get())
+	    && _fs_data_sub.copy(&fs_data) && fs_data.fb_enabled) {
 		if (_servo_iden_index >= 0 && _servo_iden_index < (int)Fs_data_s::NUM_SERVOS) {
 			data.fb_angle = fs_data.fb_angle_deg[_servo_iden_index];
 		} else {
@@ -1112,4 +1162,33 @@ void ControlAllocator::publishServoIdenData(float chirp_cmd)
 	}
 
 	_servo_iden_data_pub.publish(data);
+}
+
+// ---------------------------------------------------------------------------
+// fs_uart_servo：仅 IDEN_TYPE==3 时运行（辨识专用固件）
+// ---------------------------------------------------------------------------
+void ControlAllocator::updateFsUartServoIdenGuard(int iden_type)
+{
+#if defined(CONFIG_DRIVERS_FS_UART_SERVO)
+	const bool iden_type_changed = (_iden_type_prev != iden_type);
+
+	if (identify_is_bus_servo_mode(iden_type)) {
+		if (!fs_uart_servo_driver_running()) {
+			if (fs_uart_servo_driver_start() == 0 && iden_type_changed) {
+				PX4_INFO("总线舵机辨识：已启动 fs_uart_servo");
+			}
+		}
+
+	} else if (fs_uart_servo_driver_running()) {
+		fs_uart_servo_driver_stop();
+
+		if (iden_type_changed) {
+			PX4_INFO("已关闭 fs_uart_servo（IDEN_TYPE=%i）", iden_type);
+		}
+	}
+
+	_iden_type_prev = iden_type;
+#else
+	(void)iden_type;
+#endif
 }
