@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# Multicopter default parameters.
+#
+# NOTE: Script variables are declared/initialized/unset in the rcS script.
+#
+
+set VEHICLE_TYPE mc
+
+# MAV_TYPE_QUADROTOR 2
+param set-default MAV_TYPE 2
+
+# 辨识固件：默认打开双向 DShot 回传 RPM（需电调支持，如 BLHeli32/AM32）
+# UART 遥测仍可用 DSHOT_TEL_CFG；不支持双向时可把 DSHOT_BIDIR_EN 改回 0
+param set-default DSHOT_BIDIR_EN 1
+
+if param compare IMU_GYRO_RATEMAX 400
+then
+	param set-default IMU_GYRO_RATEMAX 800
+fi
+
+param set-default NAV_ACC_RAD 2
+
+param set-default RTL_RETURN_ALT 30
+param set-default RTL_DESCEND_ALT 10
+
+param set-default GPS_UBX_DYNMODEL 6
+
+# lower RNG_FOG since MC are expected to fly closer over obstacles
+param set-default EKF2_RNG_FOG 1.0

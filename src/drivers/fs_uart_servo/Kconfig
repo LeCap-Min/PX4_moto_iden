@@ -1,0 +1,6 @@
+menuconfig DRIVERS_FS_UART_SERVO
+	bool "fs_uart_servo (FashionStar UART bus)"
+	default n
+	---help---
+		FashionStar-compatible UART bus servo output (sync command from actuator_servos).
+

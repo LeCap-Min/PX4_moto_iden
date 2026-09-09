@@ -1,0 +1,82 @@
+############################################################################
+#
+#   Copyright (c) 2019 PX4 Development Team. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in
+#    the documentation and/or other materials provided with the
+#    distribution.
+# 3. Neither the name PX4 nor the names of its contributors may be
+#    used to endorse or promote products derived from this software
+#    without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+# OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+# AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+#
+############################################################################
+
+# 上传脚本按 USB VID/PID 自动识别 PX4 设备（移植自 PX4 main，PR #27674）
+set(PX4_UPLOADER_SCRIPT "${PX4_SOURCE_DIR}/Tools/px4_uploader.py")
+set(PX4_UPLOADER_PYTHON ${PYTHON_EXECUTABLE})
+
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/sys/kernel/osrelease")
+	file(READ "/proc/sys/kernel/osrelease" PX4_HOST_OS_RELEASE)
+	string(FIND "${PX4_HOST_OS_RELEASE}" "microsoft-standard-WSL2" PX4_WSL2_INDEX)
+
+	if(NOT PX4_WSL2_INDEX EQUAL -1)
+		find_program(PX4_WINDOWS_PYTHON_EXECUTABLE python.exe)
+
+		if(PX4_WINDOWS_PYTHON_EXECUTABLE)
+			# WSL2 下改用 Windows 侧 Python 运行上传脚本：可直接枚举/打开 Windows COM 口，
+			# 且飞控进入 bootloader 重新枚举后无需再次 usbipd attach。
+			# 固件的 WSL 绝对路径由 Windows 在 \\wsl.localhost\... 工作目录下自动解析。
+			set(PX4_UPLOADER_PYTHON ${PX4_WINDOWS_PYTHON_EXECUTABLE} -u)
+			message(STATUS "WSL2 detected: 'upload' target will use ${PX4_WINDOWS_PYTHON_EXECUTABLE}")
+		else()
+			message(STATUS "WSL2 detected but python.exe not found; 'upload' will use WSL Python (needs usbipd attach)")
+		endif()
+	endif()
+endif()
+
+add_custom_target(upload
+	COMMAND ${PX4_UPLOADER_PYTHON} ${PX4_UPLOADER_SCRIPT} ${fw_package}
+	DEPENDS ${fw_package}
+	COMMENT "uploading px4"
+	VERBATIM
+	USES_TERMINAL
+	WORKING_DIRECTORY ${PX4_BINARY_DIR}
+	)
+
+add_custom_target(force-upload
+	COMMAND ${PX4_UPLOADER_PYTHON} ${PX4_UPLOADER_SCRIPT} --force ${fw_package}
+	DEPENDS ${fw_package}
+	COMMENT "uploading px4 with --force"
+	VERBATIM
+	USES_TERMINAL
+	WORKING_DIRECTORY ${PX4_BINARY_DIR}
+	)
+
+add_custom_target(upload-verbose
+	COMMAND ${PX4_UPLOADER_PYTHON} ${PX4_UPLOADER_SCRIPT} --verbose ${fw_package}
+	DEPENDS ${fw_package}
+	COMMENT "uploading px4 with verbose output"
+	VERBATIM
+	USES_TERMINAL
+	WORKING_DIRECTORY ${PX4_BINARY_DIR}
+	)

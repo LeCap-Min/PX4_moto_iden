@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# 辨识固件：多旋翼应用（EKF2 姿态 + 手飞控制链 + control_allocator）
+#
+# NOTE: Script variables are declared/initialized/unset in the rcS script.
+#
+
+#
+# Start Control Allocator
+#
+control_allocator start
+
+#
+# Start Multicopter Rate Controller.
+#
+mc_rate_control start
+
+#
+# Start Multicopter Attitude Controller.
+#
+mc_att_control start
+
+#
+# Start Multicopter Land Detector.
+#
+land_detector start multicopter
