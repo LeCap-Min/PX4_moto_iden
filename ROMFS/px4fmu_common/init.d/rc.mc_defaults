@@ -10,32 +10,25 @@ set VEHICLE_TYPE mc
 # MAV_TYPE_QUADROTOR 2
 param set-default MAV_TYPE 2
 
-# 辨识固件：启用 control_allocator + FashionStar 舵机驱动自启（见 README）
+# 辨识固件：启用 control_allocator（fs_uart_servo 由 CA 按 IDEN_TYPE 启停）
 param set-default SYS_CTRL_ALLOC 1
-param set-default FS_UT_BOOT 1
 
 if param compare IMU_GYRO_RATEMAX 400
 then
 	param set-default IMU_GYRO_RATEMAX 800
 fi
 
-param set-default NAV_ACC_RAD 2
-
-param set-default RTL_RETURN_ALT 30
-param set-default RTL_DESCEND_ALT 10
-
 param set-default PWM_MAIN_MAX 1950
 param set-default PWM_MAIN_MIN 1075
 param set-default PWM_MAIN_RATE 400
 
-param set-default GPS_UBX_DYNMODEL 6
+# navigator 不启动，RTL_* 不会被 param_find；QGC 安全页会读取它们，
+# 这里标记为已用以便 MAVLink 上报，避免 QGC 报"固件缺少参数"
+param touch RTL_RETURN_ALT RTL_DESCEND_ALT RTL_LAND_DELAY
 
-#
-# This is the gimbal pass mixer.
-#
-set MIXER_AUX pass
-
-set MIXER quad_x
+# control_allocator 模式：跳过传统 mixer 加载
+set MIXER skip
+set MIXER_AUX none
 
 set PWM_OUT 1234
 

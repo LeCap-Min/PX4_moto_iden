@@ -20,8 +20,8 @@ float32 effective_ctrl_hz			# = min(tx_frame_hz, ca_sample_hz)，链路真实瓶
 uint32 tx_drop						# 累计 write 失败/不足
 uint32 ca_drop_dup					# 累计因 timestamp 重复被丢弃的样本
 
-# --- 回传侧（仅 FS_UT_FB=1 有效；否则下面字段为 NaN/0）---
-uint8 fb_enabled					# 1 = FS_UT_FB 开启
+# --- 回传侧（FS_UT_FB=1，或总线辨识扫频自动回传；否则下面字段为 NaN/0）---
+uint8 fb_enabled					# 1 = 当前正在查询角度
 float32[8] fb_angle_deg				# 实测角度；超时/未启用为 NaN
 float32[8] fb_query_hz				# 每通道查询成功 Hz（1s 窗口）
 uint8 online_flags					# bit i：通道 i 最近一次查询成功

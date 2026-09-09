@@ -74,12 +74,15 @@
 #include <uORB/topics/identify_data.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/parameter_update.h>
+#include <uORB/topics/Servo_iden_ctrl.h>
 #include <uORB/topics/Servo_iden_data.h>
-#include <uORB/topics/Fs_data.h>
+#include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_torque_setpoint.h>
 #include <uORB/topics/vehicle_thrust_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
+
+#include <lib/servo_iden/ServoIdenSequencer.hpp>
 
 class ControlAllocator : public ModuleBase<ControlAllocator>, public ModuleParams, public px4::ScheduledWorkItem
 {
@@ -140,15 +143,17 @@ private:
 	void updateIdentifyState(const hrt_abstime now);
 	void publishIdentifyData(float selected_motor_cmd);
 
+	/** 上锁：清完成标志并复位辨识状态机，下一次解锁可再跑一轮 */
+	void resetIdentifyAfterDisarm();
+
 	/** 舵机辨识状态机，IDEN_TYPE==3（总线）或 4（PWM）时调用 */
 	void updateServoIdenState(const hrt_abstime now);
-	void publishServoIdenData(float chirp_cmd);
+	void publishServoIdenCtrl();
+	void publishServoIdenData();
+	servo_iden::ServoIdenSequencer::Config makeServoIdenConfig() const;
 
 	/** IDEN_TYPE==3 时启动 fs_uart_servo，其余模式关闭（辨识专用固件） */
 	void updateFsUartServoIdenGuard(int iden_type);
-
-	/** 对数扫频 chirp，迁移自 mc_att_control */
-	static float computeLogChirp(float t, float f0, float f_end, float duration, float amplitude, float y0);
 
 	/** RC 手飞类模式（多数用户用自稳/定高而非纯 Manual），用于辨识门控 */
 	bool identify_rc_mode_active() const;
@@ -193,6 +198,7 @@ private:
 	uORB::Publication<actuator_servos_trim_s>	_actuator_servos_trim_pub{ORB_ID(actuator_servos_trim)};
 	uORB::Publication<identify_data_s> _identify_data_pub{ORB_ID(Identify_data)};
 	uORB::Publication<Servo_iden_data_s> _servo_iden_data_pub{ORB_ID(Servo_iden_data)};
+	uORB::Publication<Servo_iden_ctrl_s> _servo_iden_ctrl_pub{ORB_ID(Servo_iden_ctrl)};
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
@@ -201,7 +207,8 @@ private:
 	uORB::Subscription _actuator_outputs_sub{ORB_ID(actuator_outputs)};
 	uORB::Subscription _actuator_armed_sub{ORB_ID(actuator_armed)};
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
-	uORB::Subscription _fs_data_sub{ORB_ID(Fs_data)};
+	uORB::Subscription _vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
+	uORB::Subscription _servo_iden_data_sub{ORB_ID(Servo_iden_data)};
 
 	matrix::Vector3f _torque_sp;
 	matrix::Vector3f _thrust_sp;
@@ -222,8 +229,9 @@ private:
 	};
 
 	IdentifyState _identify_state{IdentifyState::Idle};
-	/** 本机上电后已完成一轮阶跃，复位需断电重启 */
-	bool _identify_completed_this_boot{false};
+	/** 本次解锁内已完成一轮辨识；上锁后清掉，允许下一次解锁再跑 */
+	bool _identify_completed_this_arm{false};
+	bool _identify_was_armed{false};
 	/** 与 identify_mode_active 一致：门控满足时才允许单电机覆盖（避免状态机在 RC 抖动时被清成 Idle 又重启） */
 	bool _identify_gate_ok{false};
 	float _identify_cmd{0.f};
@@ -239,13 +247,14 @@ private:
 	uint32_t _identify_step_idx{0};
 
 	// --- 舵机辨识状态 (IDEN_TYPE==3 总线 / 4 PWM) ---
-	bool _servo_iden_completed_this_boot{false};
+	bool _servo_iden_completed_this_arm{false};
 	bool _servo_iden_gate_ok{false};
 	float _servo_chirp_cmd{0.f};
-	float _servo_chirp_t{0.f};
-	hrt_abstime _servo_chirp_init_time{0};
-	bool _servo_chirp_time_active{false};
 	int _servo_iden_index{0}; ///< actuator_servos.control[] 下标
+	servo_iden::ServoIdenSequencer _servo_iden_seq;
+	servo_iden::ServoIdenSequencer::Output _servo_iden_out{};
+	float _gyro_dps[3] {};
+	hrt_abstime _servo_iden_last_seq{0};
 
 	int _iden_type_prev{-1}; ///< 上一周期 IDEN_TYPE，用于 fs_uart_servo 切换日志
 
@@ -259,11 +268,17 @@ private:
 		(ParamInt<px4::params::CA_R_REV>) _param_r_rev,
 		(ParamInt<px4::params::IDEN_TYPE>) _param_iden_type,
 		(ParamInt<px4::params::IDEN_MOTOR_IDX>) _param_iden_motor_idx,
-		(ParamFloat<px4::params::IDEN_TRIG_THR>) _param_iden_trig_thr,
-		(ParamFloat<px4::params::IDEN_TRIG_TIME>) _param_iden_trig_time,
 		(ParamFloat<px4::params::IDEN_STEP_TIME>) _param_iden_step_time,
 		(ParamFloat<px4::params::IDEN_AUX_THR>) _param_iden_aux_thr,
-		(ParamInt<px4::params::IDEN_SV_IDX>) _param_iden_sv_idx
+		(ParamInt<px4::params::IDEN_SV_IDX>) _param_iden_sv_idx,
+		(ParamFloat<px4::params::IDEN_CH_F0>) _param_iden_ch_f0,
+		(ParamFloat<px4::params::IDEN_CH_F1>) _param_iden_ch_f1,
+		(ParamFloat<px4::params::IDEN_CH_DUR>) _param_iden_ch_dur,
+		(ParamFloat<px4::params::IDEN_CH_AMP>) _param_iden_ch_amp,
+		(ParamFloat<px4::params::IDEN_CH_AMIN>) _param_iden_ch_amin,
+		(ParamFloat<px4::params::IDEN_CH_STEP>) _param_iden_ch_step,
+		(ParamInt<px4::params::IDEN_CH_REP>) _param_iden_ch_rep,
+		(ParamInt<px4::params::IDEN_CH_HALF>) _param_iden_ch_half
 	)
 
 };

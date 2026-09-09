@@ -454,14 +454,12 @@ else
 	fi
 
 	#
-	# Start the navigator.
-	#
-	navigator start
-
-	#
 	# Start a thermal calibration if required.
 	#
-	. ${R}etc/init.d/rc.thermal_cal
+	if param compare -s TC_A_ENABLE 1
+	then
+		. ${R}etc/init.d/rc.thermal_cal
+	fi
 
 	#
 	# Start gimbal to control mounts such as gimbals, disabled by default.

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 
+#include <lib/matrix/matrix/math.hpp>
 #include <px4_platform_common/defines.h>
 
 namespace
@@ -30,20 +31,21 @@ const char *default_uart_device_path()
 /** FashionStar FSUS_PARAM_BAUDRATE 档位 + NuttX termios 可配置速率 */
 static constexpr int k_supported_bauds[] = {9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000};
 
-/* The 1 Mbaud schedule is divided into 5 ms control windows. Four single-servo
- * queries per window give 800 queries/s aggregate, i.e. 100 Hz for each of the
- * eight servos. A 250 us service tick lets a normal response be consumed before
- * the next request without busy-waiting on the serial work queue. */
+/* 平时控制窗口 5 ms（200 Hz）。FS_UT_FB=1 时每窗口最多 4 次查询（8 路各 100 Hz）。
+ * 辨识扫频窗口由 IDEN_SV_HZ 决定，只查目标舵机，每窗口 1 次（与发送同频）。
+ * 250 µs 服务节拍用来在两次发送之间收完应答。
+ * 1 Mbaud 实测 RTT 中位约 0.8–1.0 ms；超时与「下帧同步前让路」必须同为 3 ms。
+ * 按 100 Hz 辨识留空隙；IDEN_SV_HZ=200 时起步窗口只剩约 0.4 ms，查询容易被挤掉。 */
 static constexpr hrt_abstime k_control_interval_us = 5_ms;
 static constexpr uint32_t k_control_rate_hz = 200;
 static constexpr uint32_t k_high_rate_feedback_hz_per_ch = 100;
 static constexpr uint32_t k_legacy_feedback_hz_per_ch = 10;
 static constexpr uint32_t k_high_rate_service_interval_us = 250;
-static constexpr hrt_abstime k_high_rate_query_timeout_us = 1_ms;
+static constexpr hrt_abstime k_high_rate_query_timeout_us = 3_ms;
 static constexpr hrt_abstime k_legacy_query_timeout_us = 8_ms;
 static constexpr hrt_abstime k_high_rate_post_control_quiet_us = 1_ms;
 static constexpr hrt_abstime k_legacy_post_control_quiet_us = 2_ms;
-static constexpr hrt_abstime k_query_control_guard_us = 1_ms;
+static constexpr hrt_abstime k_query_control_guard_us = 3_ms;
 static constexpr uint8_t k_max_query_budget = 4;
 
 bool is_supported_baud(int baud)
@@ -140,6 +142,7 @@ FsUartServo::FsUartServo(const char *device_path, int baud_cli) :
 	memset(_last_deg, 0, sizeof(_last_deg));
 
 	strncpy(_device_path, device_path, sizeof(_device_path) - 1);
+	_servo_iden_data_pub.advertise();
 }
 
 FsUartServo::~FsUartServo()
@@ -179,8 +182,8 @@ bool FsUartServo::init()
 	}
 
 	/* UART is opened in Run() on the serial work queue (same task as write). */
-	PX4_INFO("FashionStar servo: %s service=%" PRIu32 " Hz ctrl<=200 Hz fb_target=%" PRIu32 " Hz/ch",
-		 _device_path, 1000000U / _service_interval_us, feedback_target_hz_per_ch());
+	PX4_INFO("FashionStar servo: %s service=%" PRIu32 " Hz ctrl<=200 Hz iden=%" PRIu32 " Hz fb_target=%" PRIu32 " Hz/ch",
+		 _device_path, 1000000U / _service_interval_us, iden_ctrl_hz(), feedback_target_hz_per_ch());
 
 	return true;
 }
@@ -328,8 +331,7 @@ void FsUartServo::update_params(const bool force)
 	_last_sent_sample = 0;
 	_sent_once = false;
 
-	_service_interval_us = schedule_interval_us();
-	ScheduleOnInterval(_service_interval_us);
+	apply_service_schedule();
 
 	const int want_baud = normalize_baud((_baud_cli > 0) ? _baud_cli : _param_fs_ut_baud.get());
 
@@ -343,26 +345,63 @@ void FsUartServo::update_params(const bool force)
 uint32_t FsUartServo::schedule_interval_us() const
 {
 	const int configured_hz = math::constrain(_param_fs_ut_r_hz.get(), (int32_t)20, (int32_t)400);
-	const int selected_baud = normalize_baud((_baud_cli > 0) ? _baud_cli : _param_fs_ut_baud.get());
 
-	if (_param_fs_ut_fb.get() != 0 && selected_baud >= 1000000) {
+	/* 辨识自动回传、或 1 Mbaud 下常开 FS_UT_FB：需要在同步帧间隙收应答 */
+	if (_iden_fb_active || (_param_fs_ut_fb.get() != 0 && uart_is_1mbaud())) {
 		return k_high_rate_service_interval_us;
 	}
 
 	return 1_s / configured_hz;
 }
 
-uint32_t FsUartServo::feedback_target_hz_per_ch() const
+void FsUartServo::apply_service_schedule()
+{
+	const uint32_t want = schedule_interval_us();
+
+	if (want != _service_interval_us) {
+		_service_interval_us = want;
+		ScheduleOnInterval(_service_interval_us);
+	} else if (_service_interval_us == 0) {
+		_service_interval_us = want;
+		ScheduleOnInterval(_service_interval_us);
+	}
+}
+
+bool FsUartServo::uart_is_1mbaud() const
 {
 	const int baud = (_line_baud > 0) ? _line_baud
 			 : normalize_baud((_baud_cli > 0) ? _baud_cli : _param_fs_ut_baud.get());
-	return (baud >= 1000000) ? k_high_rate_feedback_hz_per_ch : k_legacy_feedback_hz_per_ch;
+	return baud >= 1000000;
+}
+
+bool FsUartServo::feedback_enabled() const
+{
+	return (_param_fs_ut_fb.get() != 0) || _iden_fb_active;
+}
+
+uint32_t FsUartServo::iden_ctrl_hz() const
+{
+	return (uint32_t)math::constrain(_param_iden_sv_hz.get(), (int32_t)20, (int32_t)200);
+}
+
+hrt_abstime FsUartServo::iden_ctrl_interval_us() const
+{
+	return 1_s / iden_ctrl_hz();
+}
+
+uint32_t FsUartServo::feedback_target_hz_per_ch() const
+{
+	/* 辨识：只查目标舵机，与 IDEN_SV_HZ 发送同频 */
+	if (_iden_fb_active) {
+		return iden_ctrl_hz();
+	}
+
+	return uart_is_1mbaud() ? k_high_rate_feedback_hz_per_ch : k_legacy_feedback_hz_per_ch;
 }
 
 hrt_abstime FsUartServo::query_timeout_us() const
 {
-	return feedback_target_hz_per_ch() == k_high_rate_feedback_hz_per_ch
-	       ? k_high_rate_query_timeout_us : k_legacy_query_timeout_us;
+	return uart_is_1mbaud() ? k_high_rate_query_timeout_us : k_legacy_query_timeout_us;
 }
 
 void FsUartServo::refill_query_budget(hrt_abstime now)
@@ -375,17 +414,20 @@ void FsUartServo::refill_query_budget(hrt_abstime now)
 		return;
 	}
 
-	const uint64_t windows = (now - _next_query_budget_us) / k_control_interval_us + 1U;
-	_next_query_budget_us += windows * k_control_interval_us;
+	const hrt_abstime window_us = _iden_fb_active ? iden_ctrl_interval_us() : k_control_interval_us;
+	const uint32_t rate_hz = _iden_fb_active ? iden_ctrl_hz() : k_control_rate_hz;
+	const uint64_t windows = (now - _next_query_budget_us) / window_us + 1U;
+	_next_query_budget_us += windows * window_us;
 
-	/* Each 5 ms window contributes 8*target/200 query slots. Keeping the
-	 * remainder makes the 10 Hz fallback exact without accumulating a burst. */
+	/* 每控制窗口贡献 n_ch*target/rate 个查询名额；余数留到下一窗。
+	 * 辨识只查 1 路且 target=IDEN_SV_HZ → 每窗正好 1 次。 */
+	const uint32_t n_ch = _iden_fb_active ? 1u : actuator_servos_s::NUM_CONTROLS;
+	const uint32_t max_budget = _iden_fb_active ? 1u : k_max_query_budget;
 	const uint64_t credit = (uint64_t)_query_credit
-				+ windows * actuator_servos_s::NUM_CONTROLS * feedback_target_hz_per_ch();
-	const uint32_t grant = (uint32_t)(credit / k_control_rate_hz);
-	_query_credit = (uint32_t)(credit % k_control_rate_hz);
-	_query_budget = (uint8_t)math::min((uint32_t)k_max_query_budget,
-			(uint32_t)_query_budget + grant);
+				+ windows * n_ch * feedback_target_hz_per_ch();
+	const uint32_t grant = (uint32_t)(credit / rate_hz);
+	_query_credit = (uint32_t)(credit % rate_hz);
+	_query_budget = (uint8_t)math::min(max_budget, (uint32_t)_query_budget + grant);
 }
 
 void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
@@ -396,52 +438,80 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 
 	refresh_servo_kill_state();
 
-	fs_uart_servo::SyncServoParam sp[actuator_servos_s::NUM_CONTROLS] {};
-
 	const float gain = _param_fs_ut_gain.get();
 	const float trm = _servo_kill_zero ? 0.f : _param_fs_ut_trm.get();
+	const bool mturn = _param_fs_ut_mturn.get() != 0;
+	const float angle_max = mturn ? 368640.f : 180.f;
+	const float angle_min = mturn ? -368640.f : -180.f;
+
+	float deg[actuator_servos_s::NUM_CONTROLS] {};
+
+	for (unsigned i = 0; i < actuator_servos_s::NUM_CONTROLS; i++) {
+		const float ctrl = sv.control[i];
+
+		if (!PX4_ISFINITE(ctrl)) {
+			deg[i] = _last_deg[i];
+
+		} else if (_servo_kill_zero) {
+			deg[i] = 0.f;
+
+		} else {
+			deg[i] = math::constrain(ctrl * gain + trm, angle_min, angle_max);
+		}
+	}
+
+	send_sync_deg(deg, sv.timestamp_sample, false);
+}
+
+void FsUartServo::send_iden_frame(uint8_t idx, float cmd_deg)
+{
+	float deg[actuator_servos_s::NUM_CONTROLS] {};
+
+	if (!_servo_kill_zero && PX4_ISFINITE(cmd_deg)
+	    && idx < actuator_servos_s::NUM_CONTROLS) {
+		const bool mturn = _param_fs_ut_mturn.get() != 0;
+		const float angle_max = mturn ? 368640.f : 180.f;
+		const float angle_min = mturn ? -368640.f : -180.f;
+		deg[idx] = math::constrain(cmd_deg, angle_min, angle_max);
+	}
+
+	send_sync_deg(deg, hrt_absolute_time(), true);
+}
+
+void FsUartServo::send_sync_deg(const float angle_deg[actuator_servos_s::NUM_CONTROLS],
+			       uint64_t timestamp_sample, bool skip_sample_dedup)
+{
+	if (_uart_fd < 0) {
+		return;
+	}
+
+	refresh_servo_kill_state();
+
+	fs_uart_servo::SyncServoParam sp[actuator_servos_s::NUM_CONTROLS] {};
 
 	auto u16_clamp_us = [](int32_t v) {
 		return static_cast<uint16_t>(math::constrain(v, (int32_t)0, (int32_t)UINT16_MAX));
 	};
 
-	const bool mturn = _param_fs_ut_mturn.get() != 0;
-	const float angle_max = mturn ? 368640.f : 180.f;
-	const float angle_min = mturn ? -368640.f : -180.f;
-
-	/* interval=0 selects the official basic sync command with a zero interval
-	 * (fastest mode). A non-zero interval selects the advanced trapezoidal
-	 * command, where t_acc/t_dec are meaningful. */
 	const uint16_t interval = u16_clamp_us(_param_fs_ut_intv.get());
 	const bool fastest_mode = interval == 0;
 	const uint16_t t_acc = u16_clamp_us(_param_fs_ut_tac.get());
 	const uint16_t t_dec = u16_clamp_us(_param_fs_ut_tdc.get());
+	const bool mturn = _param_fs_ut_mturn.get() != 0;
 
 	for (unsigned i = 0; i < actuator_servos_s::NUM_CONTROLS; i++) {
-		const float ctrl = sv.control[i];
 		sp[i].id = static_cast<uint8_t>(i);
 		sp[i].interval_ms = interval;
 		sp[i].t_acc_ms = t_acc;
 		sp[i].t_dec_ms = t_dec;
 		sp[i].power_mw = 0;
 
-		if (!PX4_ISFINITE(ctrl)) {
-			sp[i].angle_deg = _last_deg[i];
-
-		} else if (_servo_kill_zero) {
+		if (_servo_kill_zero) {
 			sp[i].angle_deg = 0.f;
 			_last_deg[i] = 0.f;
 
 		} else {
-			sp[i].angle_deg = ctrl * gain + trm;
-
-			if (sp[i].angle_deg > angle_max) {
-				sp[i].angle_deg = angle_max;
-
-			} else if (sp[i].angle_deg < angle_min) {
-				sp[i].angle_deg = angle_min;
-			}
-
+			sp[i].angle_deg = angle_deg[i];
 			_last_deg[i] = sp[i].angle_deg;
 		}
 
@@ -471,35 +541,31 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 		return;
 	}
 
-	/* 同一 CA 样本在 200 Hz 轮询下重复 write 会重复触发舵机指令。
-	 * 按 timestamp_sample 去重；CA 新样本才发。总线封顶 200 Hz。 */
-	static constexpr hrt_abstime k_min_send_interval_us = 5_ms;
-
+	/* 辨识按 IDEN_SV_HZ；平时同步帧仍封顶 200 Hz */
+	const hrt_abstime min_send_us = skip_sample_dedup ? iden_ctrl_interval_us() : 5_ms;
 	const bool kill_edge = _servo_kill_zero != _servo_kill_zero_prev;
 
-	const bool new_sample = !_sent_once || (sv.timestamp_sample != _last_sent_sample) || kill_edge;
+	if (!skip_sample_dedup) {
+		const bool new_sample = !_sent_once || (timestamp_sample != _last_sent_sample) || kill_edge;
 
-	if (!new_sample) {
-		if (_sent_once && sv.timestamp_sample == _last_sent_sample) {
-			_ca_drop_dup++;
+		if (!new_sample) {
+			if (_sent_once && timestamp_sample == _last_sent_sample) {
+				_ca_drop_dup++;
+			}
+
+			return;
 		}
-
-		return;
 	}
 
 	const hrt_abstime now = hrt_absolute_time();
-
-	/* 容差 200μs：_last_send 记录在 write() 前，实际线上帧间隔还要加
-	 * TX 时间(96B @500kbps ≈ 1.92ms)，真实间隔比软件计算值大。 */
 	static constexpr hrt_abstime k_send_tolerance_us = 200;
 
-	if (_last_send != 0 && (now - _last_send) + k_send_tolerance_us < k_min_send_interval_us) {
+	if (_last_send != 0 && (now - _last_send) + k_send_tolerance_us < min_send_us) {
 		_send_pending = true;
 		return;
 	}
 
 	_send_pending = false;
-
 	_last_send = now;
 	ssize_t written = ::write(_uart_fd, frame, flen);
 
@@ -515,12 +581,9 @@ void FsUartServo::send_latest_frame(const actuator_servos_s &sv)
 		_tx_bytes_win += (uint32_t)flen;
 		_tx_frames_win++;
 		_last_tx_len = flen;
-		_last_sent_sample = sv.timestamp_sample;
+		_last_sent_sample = timestamp_sample;
 		_sent_once = true;
 		_servo_kill_zero_prev = _servo_kill_zero;
-		/* write() queues the DMA transfer. Compute the actual line end before
-		 * starting the post-command quiet period. At 1 Mbaud, 1 ms quiet time
-		 * leaves enough room for four query/response transactions per 5 ms. */
 		const uint32_t baud = (_line_baud > 0) ? (uint32_t)_line_baud : (uint32_t)_effective_baud;
 		const hrt_abstime wire_time_us = ((uint64_t)flen * 10ULL * 1000000ULL + baud - 1ULL) / baud;
 		const hrt_abstime quiet_us = (baud >= 1000000)
@@ -575,13 +638,110 @@ void FsUartServo::enable_feedback()
 	_rtt_max_us = 0.f;
 }
 
+void FsUartServo::advance_query_id()
+{
+	if (_iden_pin_query) {
+		_query_id = _iden_servo_idx;
+		return;
+	}
+
+	_query_id = (uint8_t)((_query_id + 1) % actuator_servos_s::NUM_CONTROLS);
+}
+
+servo_iden::ServoIdenSequencer::Config FsUartServo::make_iden_config() const
+{
+	servo_iden::ServoIdenSequencer::Config c{};
+	c.f0 = _param_iden_ch_f0.get();
+	c.f1 = _param_iden_ch_f1.get();
+	c.dur_s = _param_iden_ch_dur.get();
+	c.amp_deg = _param_iden_ch_amp.get();
+	c.amin_deg = _param_iden_ch_amin.get();
+	c.step_deg = _param_iden_ch_step.get();
+	c.rep = static_cast<int>(_param_iden_ch_rep.get());
+	c.half_run = _param_iden_ch_half.get() != 0;
+	return c;
+}
+
+void FsUartServo::fill_iden_feedback(servo_iden::ServoIdenSequencer::Feedback &fb)
+{
+	fb = {};
+
+	if (_iden_servo_idx < actuator_servos_s::NUM_CONTROLS
+	    && PX4_ISFINITE(_fb_angle_deg[_iden_servo_idx])) {
+		fb.angle_deg = _fb_angle_deg[_iden_servo_idx];
+		fb.angle_valid = true;
+	}
+
+	vehicle_angular_velocity_s w{};
+
+	if (_vehicle_angular_velocity_sub.copy(&w)) {
+		_gyro_dps[0] = math::degrees(w.xyz[0]);
+		_gyro_dps[1] = math::degrees(w.xyz[1]);
+		_gyro_dps[2] = math::degrees(w.xyz[2]);
+		fb.gyro_dps = sqrtf(_gyro_dps[0] * _gyro_dps[0]
+				    + _gyro_dps[1] * _gyro_dps[1]
+				    + _gyro_dps[2] * _gyro_dps[2]);
+		fb.gyro_valid = PX4_ISFINITE(fb.gyro_dps);
+
+	} else {
+		_gyro_dps[0] = _gyro_dps[1] = _gyro_dps[2] = NAN;
+	}
+}
+
+void FsUartServo::publish_servo_iden_data(const servo_iden::ServoIdenSequencer::Output &out,
+		uint8_t servo_idx, hrt_abstime tx_time)
+{
+	Servo_iden_data_s data{};
+	data.timestamp = tx_time;
+	data.iden_active = !out.done && (out.phase != servo_iden::ServoIdenSequencer::Idle);
+	data.servo_idx = servo_idx;
+	data.chirp_signal = out.cmd_deg;
+	data.cmd_deg = out.cmd_deg;
+	data.phase = out.phase;
+	data.rep_idx = out.rep_idx;
+	data.sweep_t = out.sweep_t;
+	data.inst_freq_hz = out.inst_freq_hz;
+	data.amp_deg = out.amp_deg;
+	data.vmax_dps = out.vmax_dps;
+	data.f1_eff_hz = out.f1_eff_hz;
+	data.fb_source = out.fb_source;
+	data.gyro_dps[0] = _gyro_dps[0];
+	data.gyro_dps[1] = _gyro_dps[1];
+	data.gyro_dps[2] = _gyro_dps[2];
+
+	/* 发送时刻把 EKF 姿态写成滚转/俯仰（度），后处理不必再记 vehicle_attitude */
+	vehicle_attitude_s att{};
+
+	if (_vehicle_attitude_sub.copy(&att)) {
+		matrix::Quatf q(att.q);
+		matrix::Eulerf euler(q);
+		data.roll_angle = math::degrees(euler.phi());
+		data.pitch_angle = math::degrees(euler.theta());
+
+	} else {
+		data.roll_angle = NAN;
+		data.pitch_angle = NAN;
+	}
+
+	const bool fb_on = feedback_enabled();
+
+	if (fb_on && servo_idx < actuator_servos_s::NUM_CONTROLS) {
+		data.fb_angle = _fb_angle_deg[servo_idx];
+
+	} else {
+		data.fb_angle = NAN;
+	}
+
+	_servo_iden_data_pub.publish(data);
+}
+
 void FsUartServo::on_query_timeout()
 {
 	/* 标记本通道掉线、下一通道 */
 	_online_flags &= ~(1u << _query_id);
 	_fb_angle_deg[_query_id] = NAN;
 	_query_err_total++;
-	_query_id = (uint8_t)((_query_id + 1) % actuator_servos_s::NUM_CONTROLS);
+	advance_query_id();
 	_query_tx_us = 0;
 	_rx_parser.reset();
 }
@@ -592,7 +752,7 @@ bool FsUartServo::maybe_send_query()
 		return false;
 	}
 
-	if (_param_fs_ut_fb.get() == 0) {
+	if (!feedback_enabled()) {
 		return false;
 	}
 
@@ -603,19 +763,23 @@ bool FsUartServo::maybe_send_query()
 
 	const hrt_abstime now = hrt_absolute_time();
 
-	/* 同步帧结束后的安静期，以及当前 5 ms 窗口的查询配额。 */
+	/* 同步帧结束后的安静期，以及当前控制窗口的查询配额。 */
 	if (now < _post_tx_until || _query_budget == 0) {
 		return false;
 	}
 
-	/* At 1 Mbaud reserve the final millisecond before the next possible 200 Hz
-	 * control frame. A missing reply is therefore timed out before control is due. */
-	if (feedback_target_hz_per_ch() == k_high_rate_feedback_hz_per_ch && _last_send != 0) {
-		const hrt_abstime next_control = _last_send + k_control_interval_us;
+	/* 1 Mbaud：下一帧同步指令前留出超时窗口，让未到的应答先结束，避免和发送撞车。 */
+	if (uart_is_1mbaud() && _last_send != 0) {
+		const hrt_abstime ctrl_dt = _iden_fb_active ? iden_ctrl_interval_us() : k_control_interval_us;
+		const hrt_abstime next_control = _last_send + ctrl_dt;
 
 		if (now < next_control && now + k_query_control_guard_us >= next_control) {
 			return false;
 		}
+	}
+
+	if (_iden_pin_query) {
+		_query_id = _iden_servo_idx;
 	}
 
 	const bool mturn = _param_fs_ut_mturn.get() != 0;
@@ -720,8 +884,8 @@ void FsUartServo::poll_rx()
 							}
 						}
 
-						/* 切下一通道 */
-						_query_id = (uint8_t)((_query_id + 1) % actuator_servos_s::NUM_CONTROLS);
+						/* 切下一通道（辨识时钉在目标 ID） */
+						advance_query_id();
 						_query_tx_us = 0;
 					}
 				} else {
@@ -791,9 +955,10 @@ void FsUartServo::publish_fs_data()
 {
 	const hrt_abstime now = hrt_absolute_time();
 
-	/* Keep command/feedback logging aligned with the 200 Hz control cadence.
-	 * Feedback for each individual servo is still refreshed at up to 100 Hz. */
-	if (_last_fs_data_pub != 0 && (now - _last_fs_data_pub) < k_control_interval_us) {
+	/* Fs_data 与控制节拍对齐（平时 200 Hz；辨识跟 IDEN_SV_HZ）。 */
+	const hrt_abstime fs_pub_dt = _iden_fb_active ? iden_ctrl_interval_us() : k_control_interval_us;
+
+	if (_last_fs_data_pub != 0 && (now - _last_fs_data_pub) < fs_pub_dt) {
 		return;
 	}
 
@@ -820,7 +985,7 @@ void FsUartServo::publish_fs_data()
 	msg.tx_drop = _tx_drop;
 	msg.ca_drop_dup = _ca_drop_dup;
 
-	const bool fb_on = (_param_fs_ut_fb.get() != 0);
+	const bool fb_on = feedback_enabled();
 	msg.fb_enabled = (uint8_t)(fb_on ? 1 : 0);
 
 	for (unsigned i = 0; i < actuator_servos_s::NUM_CONTROLS; i++) {
@@ -862,8 +1027,54 @@ void FsUartServo::Run()
 		send_zero_sync_frame();
 	}
 
-	/* FS_UT_FB 边沿 */
-	const bool fb_now = (_param_fs_ut_fb.get() != 0);
+	actuator_servos_s srv{};
+
+	/* 先缓存最新指令，UART 真正占用要等 RX 排空后再仲裁，避免 200 Hz 发送把回传饿死。 */
+	while (_actuator_servos_sub.update(&srv)) {
+		_last_srv = srv;
+		_last_srv_valid = true;
+		_ca_samples_win++;
+	}
+
+	if (!_last_srv_valid && _actuator_servos_sub.copy(&_last_srv)) {
+		_last_srv_valid = true;
+		_ca_samples_win++;
+	}
+
+	Servo_iden_ctrl_s iden_ctrl{};
+	const bool have_ctrl = _servo_iden_ctrl_sub.copy(&iden_ctrl);
+	const bool iden_enable = have_ctrl && iden_ctrl.enable;
+	_iden_servo_idx = (have_ctrl && iden_ctrl.servo_idx < actuator_servos_s::NUM_CONTROLS)
+			  ? iden_ctrl.servo_idx : (uint8_t)0;
+
+	actuator_armed_s armed_msg{};
+	const bool is_armed = _actuator_armed_sub.copy(&armed_msg) && armed_msg.armed;
+
+	if (_iden_was_armed && !is_armed) {
+		_iden_completed_this_arm = false;
+		_iden_seq.reset();
+		_iden_last_out = {};
+		_iden_pin_query = false;
+	}
+
+	_iden_was_armed = is_armed;
+
+	if (!iden_enable) {
+		_iden_seq.reset();
+		_iden_pin_query = false;
+
+	} else if (!_iden_completed_this_arm) {
+		_iden_pin_query = true;
+		_query_id = _iden_servo_idx;
+	}
+
+	const bool iden_hold = iden_enable && !_servo_kill_zero;
+	const bool iden_run = iden_hold && !_iden_completed_this_arm;
+
+	/* 扫频进行中自动开回传；结束后若 FS_UT_FB=0 则关掉 */
+	_iden_fb_active = iden_run;
+
+	const bool fb_now = feedback_enabled();
 
 	if (fb_now != _fb_enabled_prev) {
 		if (fb_now) {
@@ -876,46 +1087,87 @@ void FsUartServo::Run()
 		_fb_enabled_prev = fb_now;
 	}
 
-	actuator_servos_s srv{};
-
-	/* Always cache the newest command, but arbitrate UART access only after RX
-	 * has been drained. This prevents a 200 Hz control stream from starving
-	 * feedback queries or transmitting over a pending servo response. */
-	while (_actuator_servos_sub.update(&srv)) {
-		_last_srv = srv;
-		_last_srv_valid = true;
-		_ca_samples_win++;
+	/* enable_feedback() 会把查询 ID 置 0，辨识需钉回目标舵机 */
+	if (_iden_pin_query) {
+		_query_id = _iden_servo_idx;
 	}
 
-	if (!_last_srv_valid && _actuator_servos_sub.copy(&_last_srv)) {
-		_last_srv_valid = true;
-		_ca_samples_win++;
-	}
+	apply_service_schedule();
 
 	/* 回传：必须先收 RX/处理超时，再决定本周期总线由查询还是同步帧使用。 */
 	if (fb_now) {
 		poll_rx();
 		refill_query_budget(hrt_absolute_time());
+
+		if (_iden_fb_active && _query_budget > 1) {
+			_query_budget = 1;
+		}
 	}
 
 	const bool kill_edge = _servo_kill_zero != _servo_kill_zero_prev;
-	const bool sync_pending = _last_srv_valid
-			&& (!_sent_once || _send_pending || kill_edge || _last_srv.timestamp_sample != _last_sent_sample);
 	const hrt_abstime now = hrt_absolute_time();
-	const bool control_due = sync_pending && (_last_send == 0 || kill_edge
-			|| (now - _last_send) + 200 >= k_control_interval_us);
 	const bool query_due = fb_now && _query_tx_us == 0 && _query_budget > 0 && now >= _post_tx_until;
 
-	if (_query_tx_us == 0) {
-		if (kill_edge && sync_pending) {
-			/* Safety zero always wins over telemetry. */
-			send_latest_frame(_last_srv);
+	if (iden_hold) {
+		const bool control_due = (_last_send == 0 || kill_edge
+					  || (now - _last_send) + 200 >= iden_ctrl_interval_us());
 
-		} else if (control_due) {
-			send_latest_frame(_last_srv);
+		if (_query_tx_us == 0) {
+			if (kill_edge) {
+				send_iden_frame(_iden_servo_idx, 0.f);
 
-		} else if (query_due) {
-			(void)maybe_send_query();
+			} else if (control_due) {
+				if (iden_run) {
+					servo_iden::ServoIdenSequencer::Feedback fb{};
+					fill_iden_feedback(fb);
+					const auto out = _iden_seq.update(now, make_iden_config(), fb);
+					_iden_last_out = out;
+					const hrt_abstime send_before = _last_send;
+					send_iden_frame(_iden_servo_idx, out.cmd_deg);
+
+					if (_last_send != send_before) {
+						publish_servo_iden_data(out, _iden_servo_idx, _last_send);
+					}
+
+					if (out.done) {
+						_iden_completed_this_arm = true;
+						_iden_pin_query = false;
+					}
+
+				} else {
+					/* 已完成：继续发 0° 并发布 Done，供 CA 锁存（保持到本次解锁结束） */
+					send_iden_frame(_iden_servo_idx, 0.f);
+					servo_iden::ServoIdenSequencer::Output done_out = _iden_last_out;
+					done_out.cmd_deg = 0.f;
+					done_out.phase = servo_iden::ServoIdenSequencer::Done;
+					done_out.done = true;
+					done_out.amp_deg = 0.f;
+					done_out.inst_freq_hz = 0.f;
+					publish_servo_iden_data(done_out, _iden_servo_idx, _last_send);
+				}
+
+			} else if (query_due && iden_run) {
+				(void)maybe_send_query();
+			}
+		}
+
+	} else {
+		const bool sync_pending = _last_srv_valid
+				&& (!_sent_once || _send_pending || kill_edge || _last_srv.timestamp_sample != _last_sent_sample);
+		const bool control_due = sync_pending && (_last_send == 0 || kill_edge
+				|| (now - _last_send) + 200 >= k_control_interval_us);
+
+		if (_query_tx_us == 0) {
+			if (kill_edge && sync_pending) {
+				/* Safety zero always wins over telemetry. */
+				send_latest_frame(_last_srv);
+
+			} else if (control_due) {
+				send_latest_frame(_last_srv);
+
+			} else if (query_due) {
+				(void)maybe_send_query();
+			}
 		}
 	}
 
@@ -1056,10 +1308,14 @@ int FsUartServo::print_status()
 		 (double)_rx_bps, (double)(_rx_bps / 1000.0f), (double)_bus_util_pct);
 	PX4_INFO("CA samples %.1f Hz   effective ctrl %.1f Hz (min(tx,ca))",
 		 (double)_ca_hz, (double)_effective_ctrl_hz);
+	PX4_INFO("iden ctrl/fb %" PRIu32 " Hz (IDEN_SV_HZ)", iden_ctrl_hz());
 
-	if (_param_fs_ut_fb.get() != 0) {
-		PX4_INFO("feedback ON target=%" PRIu32 " Hz/ch budget=%u online=0x%02X q_ok=%" PRIu32 " q_err=%" PRIu32,
-			 feedback_target_hz_per_ch(), _query_budget, _online_flags, _query_ok_total, _query_err_total);
+	if (feedback_enabled()) {
+		PX4_INFO("feedback %s target=%" PRIu32 " Hz%s budget=%u online=0x%02X q_ok=%" PRIu32 " q_err=%" PRIu32,
+			 _param_fs_ut_fb.get() != 0 ? "ON" : "AUTO(iden)",
+			 feedback_target_hz_per_ch(),
+			 _iden_fb_active ? "/ch ident-pin" : "/ch",
+			 _query_budget, _online_flags, _query_ok_total, _query_err_total);
 		PX4_INFO("RX frames=%" PRIu32 " mismatch=%" PRIu32 " checksum=%" PRIu32
 			 " seen_id=0x%02X last(cmd/id/len)=%u/%u/%u waiting_id=%u",
 			 _rx_frame_total, _rx_match_miss_total, _rx_checksum_err_total, _rx_seen_id_flags,
@@ -1079,7 +1335,7 @@ int FsUartServo::print_status()
 			 (unsigned long long)query_timeout_us());
 
 	} else {
-		PX4_INFO("feedback OFF (set FS_UT_FB=1 to enable angle readback)");
+		PX4_INFO("feedback OFF（平时关；辨识扫频时自动按 IDEN_SV_HZ 回传）");
 	}
 
 	return 0;
@@ -1088,4 +1344,11 @@ int FsUartServo::print_status()
 extern "C" __EXPORT int fs_uart_servo_main(int argc, char *argv[])
 {
 	return FsUartServo::main(argc, argv);
+}
+
+/* 供 control_allocator 高频轮询的静默运行状态查询：
+ * 不能用 "status" 子命令，它会打印整页状态，200 Hz 调用会把 CA 拖慢到几 Hz。 */
+extern "C" __EXPORT bool fs_uart_servo_is_running(void)
+{
+	return FsUartServo::is_running();
 }

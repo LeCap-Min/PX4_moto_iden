@@ -53,4 +53,5 @@ px4_add_module(
 		ControlAllocation
 		mixer
 		px4_work_queue
+		servo_iden
 )

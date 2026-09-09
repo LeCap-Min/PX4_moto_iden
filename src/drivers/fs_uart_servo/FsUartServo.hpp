@@ -25,12 +25,17 @@
 #include <uORB/topics/manual_control_switches.h>
 #include <uORB/topics/actuator_servos.h>
 #include <uORB/topics/Fs_data.h>
+#include <uORB/topics/Servo_iden_ctrl.h>
+#include <uORB/topics/Servo_iden_data.h>
 #include <uORB/topics/parameter_update.h>
+#include <uORB/topics/vehicle_angular_velocity.h>
+#include <uORB/topics/vehicle_attitude.h>
 
 #include <drivers/drv_hrt.h>
 #include <math.h>
 
 #include <lib/mathlib/mathlib.h>
+#include <lib/servo_iden/ServoIdenSequencer.hpp>
 
 #include "fs_protocol.hpp"
 
@@ -55,6 +60,11 @@ private:
 
 	void update_params(const bool force);
 	uint32_t schedule_interval_us() const;
+	void apply_service_schedule(); ///< 辨识启停时切换 4 kHz / 普通轮询节拍
+	bool uart_is_1mbaud() const;
+	bool feedback_enabled() const; ///< FS_UT_FB=1，或辨识扫频期间自动回传
+	uint32_t iden_ctrl_hz() const; ///< 总线辨识发送/回传频率（IDEN_SV_HZ）
+	hrt_abstime iden_ctrl_interval_us() const;
 	uint32_t feedback_target_hz_per_ch() const;
 	hrt_abstime query_timeout_us() const;
 	void refill_query_budget(hrt_abstime now);
@@ -66,13 +76,23 @@ private:
 
 	void send_latest_frame(const actuator_servos_s &sv);
 	void send_zero_sync_frame(); ///< UART 就绪后主动下发 0°，不依赖 actuator_servos 订阅
+	/** 按最终角度组同步帧。skip_sample_dedup 时不按 CA timestamp 去重（辨识 5 ms 节拍）。 */
+	void send_sync_deg(const float angle_deg[actuator_servos_s::NUM_CONTROLS],
+			   uint64_t timestamp_sample, bool skip_sample_dedup);
+	void send_iden_frame(uint8_t idx, float cmd_deg);
 
-	/* --- 角度回传（FS_UT_FB=1）--- */
-	void poll_rx();                     ///< drain UART RX, feed parser, update fb_*
-	bool maybe_send_query();            ///< issue next query if window permits
-	void on_query_timeout();            ///< mark current id offline, advance ring
-	void disable_feedback();            ///< called when FS_UT_FB transitions 1->0
-	void enable_feedback();             ///< called when FS_UT_FB transitions 0->1
+	void advance_query_id();
+	servo_iden::ServoIdenSequencer::Config make_iden_config() const;
+	void fill_iden_feedback(servo_iden::ServoIdenSequencer::Feedback &fb);
+	void publish_servo_iden_data(const servo_iden::ServoIdenSequencer::Output &out,
+				     uint8_t servo_idx, hrt_abstime tx_time);
+
+	/* --- 角度回传（FS_UT_FB=1，或辨识扫频期间自动开启）--- */
+	void poll_rx();                     ///< 排空 UART RX，解析并更新 fb_*
+	bool maybe_send_query();            ///< 窗口允许时发下一帧查询
+	void on_query_timeout();            ///< 当前 ID 掉线，轮询前进
+	void disable_feedback();            ///< 回传关闭（参数关且未在辨识）
+	void enable_feedback();             ///< 回传开启
 
 	/* --- 统计 / Fs_data --- */
 	void update_stats_window();         ///< 1s window diff → snapshot
@@ -148,12 +168,25 @@ private:
 	uORB::Subscription _actuator_servos_sub{ORB_ID(actuator_servos)};
 	uORB::Subscription _actuator_armed_sub{ORB_ID(actuator_armed)};
 	uORB::Subscription _manual_control_switches_sub{ORB_ID(manual_control_switches)};
+	uORB::Subscription _servo_iden_ctrl_sub{ORB_ID(Servo_iden_ctrl)};
+	uORB::Subscription _vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
+	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
 	uORB::Publication<Fs_data_s> _fs_data_pub{ORB_ID(Fs_data)};
+	uORB::Publication<Servo_iden_data_s> _servo_iden_data_pub{ORB_ID(Servo_iden_data)};
 
 	bool _servo_kill_zero{false};
 	bool _servo_kill_zero_prev{false};
+
+	servo_iden::ServoIdenSequencer _iden_seq;
+	servo_iden::ServoIdenSequencer::Output _iden_last_out{};
+	bool _iden_completed_this_arm{false};
+	bool _iden_was_armed{false};
+	bool _iden_pin_query{false};
+	bool _iden_fb_active{false}; ///< 扫频进行中：自动回传，频率与 IDEN_SV_HZ 相同
+	uint8_t _iden_servo_idx{0};
+	float _gyro_dps[3] {};
 
 	DEFINE_PARAMETERS(
 		(ParamFloat<px4::params::FS_UT_GAIN>) _param_fs_ut_gain,
@@ -165,6 +198,15 @@ private:
 		(ParamInt<px4::params::FS_UT_R_HZ>) _param_fs_ut_r_hz,
 		(ParamInt<px4::params::FS_UT_MTURN>) _param_fs_ut_mturn,
 		(ParamInt<px4::params::FS_UT_FB>) _param_fs_ut_fb,
-		(ParamInt<px4::params::FS_UT_1WIRE>) _param_fs_ut_1wire
+		(ParamInt<px4::params::FS_UT_1WIRE>) _param_fs_ut_1wire,
+		(ParamFloat<px4::params::IDEN_CH_F0>) _param_iden_ch_f0,
+		(ParamFloat<px4::params::IDEN_CH_F1>) _param_iden_ch_f1,
+		(ParamFloat<px4::params::IDEN_CH_DUR>) _param_iden_ch_dur,
+		(ParamFloat<px4::params::IDEN_CH_AMP>) _param_iden_ch_amp,
+		(ParamFloat<px4::params::IDEN_CH_AMIN>) _param_iden_ch_amin,
+		(ParamFloat<px4::params::IDEN_CH_STEP>) _param_iden_ch_step,
+		(ParamInt<px4::params::IDEN_CH_REP>) _param_iden_ch_rep,
+		(ParamInt<px4::params::IDEN_CH_HALF>) _param_iden_ch_half,
+		(ParamInt<px4::params::IDEN_SV_HZ>) _param_iden_sv_hz
 	)
 };

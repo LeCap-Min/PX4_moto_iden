@@ -31,54 +31,31 @@
 #
 ############################################################################
 
-# NuttX CDCACM vendor and product strings
-set(vendorstr_underscore)
-set(productstr_underscore)
-string(REPLACE " " "_" vendorstr_underscore ${CONFIG_CDCACM_VENDORSTR})
-string(REPLACE " " "_" productstr_underscore ${CONFIG_CDCACM_PRODUCTSTR})
+# 上传脚本按 USB VID/PID 自动识别 PX4 设备（移植自 PX4 main，PR #27674）
+set(PX4_UPLOADER_SCRIPT "${PX4_SOURCE_DIR}/Tools/px4_uploader.py")
+set(PX4_UPLOADER_PYTHON ${PYTHON_EXECUTABLE})
 
-set(serial_ports)
-if(${CMAKE_HOST_SYSTEM_NAME} STREQUAL "Linux")
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/sys/kernel/osrelease")
+	file(READ "/proc/sys/kernel/osrelease" PX4_HOST_OS_RELEASE)
+	string(FIND "${PX4_HOST_OS_RELEASE}" "microsoft-standard-WSL2" PX4_WSL2_INDEX)
 
-	set(px4_usb_path "${vendorstr_underscore}_${productstr_underscore}")
+	if(NOT PX4_WSL2_INDEX EQUAL -1)
+		find_program(PX4_WINDOWS_PYTHON_EXECUTABLE python.exe)
 
-	list(APPEND serial_ports
-		# NuttX vendor + product string
-		/dev/serial/by-id/*-${px4_usb_path}*
-
-		# Bootloader
-		/dev/serial/by-id/*PX4_BL* # typical bootloader USB device string
-		/dev/serial/by-id/*BL_FMU*
-
-		# TODO: handle these per board
-		/dev/serial/by-id/usb-The_Autopilot*
-		/dev/serial/by-id/usb-Bitcraze*
-		/dev/serial/by-id/pci-Bitcraze*
-		/dev/serial/by-id/usb-Gumstix*
-		/dev/serial/by-id/usb-Hex_ProfiCNC*
-		/dev/serial/by-id/usb-UVify*
-		/dev/serial/by-id/usb-ArduPilot*
-		)
-
-elseif(${CMAKE_HOST_SYSTEM_NAME} STREQUAL "Darwin")
-	list(APPEND serial_ports
-		/dev/tty.usbmodemPX*,/dev/tty.usbmodem*
-		)
-elseif(${CMAKE_HOST_SYSTEM_NAME} STREQUAL "CYGWIN")
-	list(APPEND serial_ports
-		/dev/ttyS*
-		)
-elseif(${CMAKE_HOST_SYSTEM_NAME} STREQUAL "Windows")
-	foreach(port RANGE 32 0)
-		list(APPEND serial_ports
-			"COM${port}")
-	endforeach()
+		if(PX4_WINDOWS_PYTHON_EXECUTABLE)
+			# WSL2 下改用 Windows 侧 Python 运行上传脚本：可直接枚举/打开 Windows COM 口，
+			# 且飞控进入 bootloader 重新枚举后无需再次 usbipd attach。
+			# 固件的 WSL 绝对路径由 Windows 在 \\wsl.localhost\... 工作目录下自动解析。
+			set(PX4_UPLOADER_PYTHON ${PX4_WINDOWS_PYTHON_EXECUTABLE} -u)
+			message(STATUS "WSL2 detected: 'upload' target will use ${PX4_WINDOWS_PYTHON_EXECUTABLE}")
+		else()
+			message(STATUS "WSL2 detected but python.exe not found; 'upload' will use WSL Python (needs usbipd attach)")
+		endif()
+	endif()
 endif()
 
-string(REPLACE ";" "," serial_ports "${serial_ports}")
-
 add_custom_target(upload
-	COMMAND ${PYTHON_EXECUTABLE} ${PX4_SOURCE_DIR}/Tools/px_uploader.py --port ${serial_ports} ${fw_package}
+	COMMAND ${PX4_UPLOADER_PYTHON} ${PX4_UPLOADER_SCRIPT} ${fw_package}
 	DEPENDS ${fw_package}
 	COMMENT "uploading px4"
 	VERBATIM
@@ -87,9 +64,18 @@ add_custom_target(upload
 	)
 
 add_custom_target(force-upload
-	COMMAND ${PYTHON_EXECUTABLE} ${PX4_SOURCE_DIR}/Tools/px_uploader.py --force --port ${serial_ports} ${fw_package}
+	COMMAND ${PX4_UPLOADER_PYTHON} ${PX4_UPLOADER_SCRIPT} --force ${fw_package}
 	DEPENDS ${fw_package}
 	COMMENT "uploading px4 with --force"
+	VERBATIM
+	USES_TERMINAL
+	WORKING_DIRECTORY ${PX4_BINARY_DIR}
+	)
+
+add_custom_target(upload-verbose
+	COMMAND ${PX4_UPLOADER_PYTHON} ${PX4_UPLOADER_SCRIPT} --verbose ${fw_package}
+	DEPENDS ${fw_package}
+	COMMENT "uploading px4 with verbose output"
 	VERBATIM
 	USES_TERMINAL
 	WORKING_DIRECTORY ${PX4_BINARY_DIR}

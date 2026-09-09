@@ -574,62 +574,39 @@ PARAM_DEFINE_INT32(COM_FLTMODE5, -1);
 PARAM_DEFINE_INT32(COM_FLTMODE6, -1);
 
 /**
- * Identify function type
+ * 辨识模式
  *
- * Select what identify mode should run.
+ * 选择当前固件运行哪种辨识流程。1/2 为单电机推力阶跃辨识，3/4 为自适应舵机扫频辨识。
+ * 设为 3 时 control_allocator 自动启动 fs_uart_servo 总线舵机驱动，其它模式自动关闭。
  *
- * @group Commander
- * @value 0 Disabled
- * @value 1 Motor identify (fixed time step, IDEN_STEP_TIME)
- * @value 2 Motor identify (AUX2 rising edge: <=0 to >0 adds one step; falling edge holds level)
- * @value 3 Bus servo identify (FashionStar UART log-chirp, AUX1 gate, target = IDEN_SV_IDX)
- * @value 4 PWM servo identify (log-chirp, AUX1 gate, target = IDEN_SV_IDX)
+ * @group 电机/舵机辨识
+ * @value 0 关闭
+ * @value 1 电机辨识：定时升档（每档保持 IDEN_STEP_TIME 秒）
+ * @value 2 电机辨识：AUX2 上升沿升档（由 <=0 变为 >0 升一档，下降沿保持）
+ * @value 3 总线舵机扫频（FashionStar UART，AUX1 门控，目标 = IDEN_SV_IDX）
+ * @value 4 PWM 舵机扫频（AUX1 门控，目标 = IDEN_SV_IDX）
  */
 PARAM_DEFINE_INT32(IDEN_TYPE, 0);
 
 /**
- * Identify motor index
+ * 辨识目标电机序号
  *
- * Target motor index for motor identification.
+ * 电机辨识（IDEN_TYPE=1/2）时被激励的电机序号，1 基，对应控制分配中的电机顺序。
+ * 其余电机输出保持为 0。
  *
- * @group Commander
+ * @group 电机/舵机辨识
  * @min 1
  * @max 12
  */
 PARAM_DEFINE_INT32(IDEN_MOTOR_IDX, 1);
 
 /**
- * Identify trigger throttle threshold
+ * 电机辨识每档保持时间
  *
- * Trigger identify after throttle is above this value for IDEN_TRIG_TIME.
+ * IDEN_TYPE=1 定时升档模式下，每一个推力档位的保持时长。
+ * 推力指令从 0.1 到 1.0，步长 0.05，共 19 档。
  *
- * @group Commander
- * @unit norm
- * @min 0.0
- * @max 1.0
- * @decimal 2
- */
-PARAM_DEFINE_FLOAT(IDEN_TRIG_THR, 0.3f);
-
-/**
- * Identify trigger hold time
- *
- * Throttle must stay above IDEN_TRIG_THR for this duration to start identify.
- *
- * @group Commander
- * @unit s
- * @min 0.1
- * @max 10.0
- * @decimal 2
- */
-PARAM_DEFINE_FLOAT(IDEN_TRIG_TIME, 1.0f);
-
-/**
- * Identify step hold time
- *
- * Duration for each identify thrust step (0.1, 0.15, ... 1.0 in steps of 0.05).
- *
- * @group Commander
+ * @group 电机/舵机辨识
  * @unit s
  * @min 0.1
  * @max 10.0
@@ -638,13 +615,12 @@ PARAM_DEFINE_FLOAT(IDEN_TRIG_TIME, 1.0f);
 PARAM_DEFINE_FLOAT(IDEN_STEP_TIME, 5.0f);
 
 /**
- * Identify AUX1 threshold
+ * 舵机辨识 AUX1 门限
  *
- * When RC AUX1 (manual_control_setpoint.aux1, -1..1) is above this value,
- * motor identify is allowed (IDEN_TYPE 1 or 2). Servo identify (3 or 4)
- * also requires aux1 above this threshold.
+ * 舵机辨识（IDEN_TYPE=3/4）时，遥控 AUX1（manual_control_setpoint.aux1，范围 -1..1）
+ * 高于该值才允许进入自适应扫频。电机辨识（IDEN_TYPE=1/2）固定使用 aux1 > 0 判断，不受此参数影响。
  *
- * @group Commander
+ * @group 电机/舵机辨识
  * @min -1.0
  * @max 1.0
  * @decimal 2
@@ -652,18 +628,133 @@ PARAM_DEFINE_FLOAT(IDEN_STEP_TIME, 5.0f);
 PARAM_DEFINE_FLOAT(IDEN_AUX_THR, 0.3f);
 
 /**
- * Identify servo channel index
+ * 辨识目标舵机通道
  *
- * Target actuator_servos.control[] index for servo identification.
- * IDEN_TYPE=3: FashionStar UART bus servo ID (same as fs_uart_servo servo_id).
- * IDEN_TYPE=4: PWM Servo channel (Servo1..Servo8 via PWM_*_FUNCx mapping).
- * Example: set 1 to excite channel 1 only; set 2 for channel 2, etc.
+ * 舵机辨识时被激励的 actuator_servos.control[] 通道下标（0–7）。
+ * IDEN_TYPE=3：为 FashionStar 总线舵机 ID（与 fs_uart_servo 协议中的 servo_id 一致）；
+ * IDEN_TYPE=4：为 PWM Servo 通道（Servo1…Servo8，需与 PWM_MAIN_FUNCx / PWM_AUX_FUNCx 映射一致）。
+ * 例如设为 1 仅激励 1 号通道，设为 2 仅激励 2 号通道。
  *
- * @group Commander
+ * @group 电机/舵机辨识
  * @min 0
  * @max 7
  */
 PARAM_DEFINE_INT32(IDEN_SV_IDX, 1);
+
+/**
+ * 总线舵机辨识控制频率
+ *
+ * 仅 IDEN_TYPE=3：扫频期间同步角指令的发送频率。回传自动按同一频率查询目标舵机（一发一问）。
+ * 与 FS_UT_R_HZ 无关；平时跟控仍由 FS_UT_R_HZ / 200 Hz 上限决定。
+ * PWM 舵机辨识（IDEN_TYPE=4）不使用本参数。
+ * 建议不低于 6×IDEN_CH_F1（扫到 30 Hz 时用 200 Hz）；过低则高频段欠采样。
+ *
+ * @group 电机/舵机辨识
+ * @unit Hz
+ * @min 20
+ * @max 200
+ * @increment 10
+ */
+PARAM_DEFINE_INT32(IDEN_SV_HZ, 200);
+
+/**
+ * 舵机扫频起始频率
+ *
+ * 对数扫频与引导正弦的起始频率。位置伺服再往下增益恒为 1，没有额外信息。
+ *
+ * @group 电机/舵机辨识
+ * @unit Hz
+ * @min 0.05
+ * @max 10.0
+ * @decimal 2
+ */
+PARAM_DEFINE_FLOAT(IDEN_CH_F0, 0.2f);
+
+/**
+ * 舵机扫频上限频率
+ *
+ * 实际扫到 min(本参数, 由速率自测得到的 f1_eff)。无反馈时即用本值。
+ *
+ * @group 电机/舵机辨识
+ * @unit Hz
+ * @min 1.0
+ * @max 80.0
+ * @decimal 1
+ */
+PARAM_DEFINE_FLOAT(IDEN_CH_F1, 30.0f);
+
+/**
+ * 单次扫频时长
+ *
+ * 每一次全幅或半幅对数扫频的时长（不含引导与段间停顿）。
+ *
+ * @group 电机/舵机辨识
+ * @unit s
+ * @min 10.0
+ * @max 600.0
+ * @decimal 0
+ */
+PARAM_DEFINE_FLOAT(IDEN_CH_DUR, 90.0f);
+
+/**
+ * 舵机扫频低频幅值
+ *
+ * 低于速率饱和边界时使用的固定幅值（度）。高频段按 0.6·Vmax/(2πf) 自动缩小，且不低于 IDEN_CH_AMIN。
+ *
+ * @group 电机/舵机辨识
+ * @unit deg
+ * @min 1.0
+ * @max 45.0
+ * @decimal 1
+ */
+PARAM_DEFINE_FLOAT(IDEN_CH_AMP, 8.0f);
+
+/**
+ * 舵机扫频最小幅值
+ *
+ * 幅值触底时对应的频率即为有效扫频上限 f1_eff。保证回传量化噪声下仍有足够信噪比。
+ *
+ * @group 电机/舵机辨识
+ * @unit deg
+ * @min 0.2
+ * @max 10.0
+ * @decimal 1
+ */
+PARAM_DEFINE_FLOAT(IDEN_CH_AMIN, 1.5f);
+
+/**
+ * 速率自测阶跃幅值
+ *
+ * 静置后按 0 → +S → −S → 0 各保持 1 秒，用陀螺或总线回传估计峰值角速度 Vmax。
+ *
+ * @group 电机/舵机辨识
+ * @unit deg
+ * @min 2.0
+ * @max 45.0
+ * @decimal 1
+ */
+PARAM_DEFINE_FLOAT(IDEN_CH_STEP, 15.0f);
+
+/**
+ * 全幅扫频重复次数
+ *
+ * 用于计算相干函数。总时长约 1+4+N×(2/F0+DUR+2) 秒，另加半幅扫频（若开启）。
+ *
+ * @group 电机/舵机辨识
+ * @min 1
+ * @max 5
+ */
+PARAM_DEFINE_INT32(IDEN_CH_REP, 3);
+
+/**
+ * 半幅扫频（线性性检验）
+ *
+ * 全幅重复完成后，再用一半幅值扫一次。两组频响重合则线性假设成立。
+ *
+ * @group 电机/舵机辨识
+ * @boolean
+ */
+PARAM_DEFINE_INT32(IDEN_CH_HALF, 1);
 
 /**
  * Maximum EKF position innovation test ratio that will allow arming

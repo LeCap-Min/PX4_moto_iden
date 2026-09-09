@@ -16,4 +16,6 @@ px4_add_module(
 		module.yaml
 	DEPENDS
 		px4_work_queue
+		mathlib
+		servo_iden
 )
